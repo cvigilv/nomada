@@ -77,19 +77,6 @@ quota.
    `status` exits with an error and marks the problem if a folder is missing
    or Zotero or the add-on can't be reached.
 
-5. **Optional: run automatically with launchd.** In both `.plist` files
-   replace `USERNAME`, the Drive path in `WatchPaths`, and the `uv` path (run
-   `which uv`), then:
-   ```sh
-   mkdir -p ~/.local/state/nomada
-   cp com.user.zotero-nomad-*.plist ~/Library/LaunchAgents/
-   launchctl load -w ~/Library/LaunchAgents/com.user.zotero-nomad-inbox.plist
-   launchctl load -w ~/Library/LaunchAgents/com.user.zotero-nomad-import.plist
-   ```
-   The `inbox` agent runs `nomada push` every 3 minutes; the `import` agent
-   runs `nomada pull` when EXPORT changes and every 5 minutes as a fallback.
-   To stop one: `launchctl unload ~/Library/LaunchAgents/<label>.plist`.
-
 ## Files
 
 | what   | where |
@@ -116,6 +103,3 @@ API key.
   guarantees uniqueness.
 - **Deletion is soft.** `pull` moves the INBOX original to `INBOX/_archived` and
   the handled export to `EXPORT/_processed`.
-- **Google Drive for desktop in *mirror* mode** is what makes `WatchPaths`
-  reliable; streaming mode may not emit local file-system events, which is why
-  the `import` agent also runs on a timer.
