@@ -28,7 +28,9 @@ through the Zotero Web API instead.
 from __future__ import annotations
 
 import base64
+import contextlib
 import dataclasses
+import fcntl
 import json
 import os
 import shutil
@@ -38,7 +40,7 @@ import tomllib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import NoReturn
+from typing import Iterator, NoReturn
 
 import click
 import requests
@@ -63,6 +65,7 @@ CONFIG_FILE = _xdg_dir("XDG_CONFIG_HOME", ".config") / "config.toml"
 STATE_DIR = _xdg_dir("XDG_STATE_HOME", ".local/state")
 STATE_FILE = STATE_DIR / "state.json"
 LOG_FILE = STATE_DIR / "nomada.log"
+LOCK_FILE = STATE_DIR / "lock"
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +197,18 @@ def log(job: str, msg: str, *, error: bool = False, persist: bool = True) -> Non
 def fail(job: str, msg: str) -> NoReturn:
     log(job, msg, error=True)
     raise click.ClickException(msg)
+
+
+@contextlib.contextmanager
+def state_lock() -> Iterator[None]:
+    """Hold an exclusive lock on the state for the duration of a push or pull."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK_FILE.open("w") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise click.ClickException(f"another nomada run is in progress (lock held on {LOCK_FILE})")
+        yield
 
 
 def load_state() -> dict:
@@ -504,20 +519,25 @@ def config() -> None:
 @cli.command()
 def push() -> None:
     """Copy papers tagged "new" in Zotero to the SuperNote INBOX."""
-    finish(run_push(load_config()))
+    cfg = load_config()
+    with state_lock():
+        finish(run_push(cfg))
 
 
 @cli.command()
 def pull() -> None:
     """Attach annotated PDFs from the SuperNote EXPORT folder to their Zotero items."""
-    finish(run_pull(load_config()))
+    cfg = load_config()
+    with state_lock():
+        finish(run_pull(cfg))
 
 
 @cli.command()
 def sync() -> None:
     """Run `pull`, then `push`."""
     cfg = load_config()
-    finish(run_pull(cfg) + run_push(cfg))
+    with state_lock():
+        finish(run_pull(cfg) + run_push(cfg))
 
 
 @cli.command()
