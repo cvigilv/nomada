@@ -358,6 +358,11 @@ def run_push(cfg: Config) -> int:
             log(job, f"item {key} is tagged '{cfg.tag_new}' but has no stored PDF", error=True)
             failures += 1
             continue
+        if len(originals) > 1:
+            keys = ", ".join(o["key"] for o in originals)
+            log(job, f"item {key} has {len(originals)} stored PDFs ({keys}); keep one or attach the others as links", error=True)
+            failures += 1
+            continue
 
         ch = originals[0]
         fname = ch["data"]["filename"]
