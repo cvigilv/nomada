@@ -1,134 +1,121 @@
-# Zotero ⇄ SuperNote Nomad sync (Zotero 9)
+# nomada: Zotero ⇄ SuperNote Nomad sync (Zotero 9)
 
-Two small jobs that move papers between Zotero and a SuperNote Nomad through
-Google Drive:
+`nomada` moves papers between Zotero and a SuperNote Nomad through a synced
+folder (Google Drive, Insync, …):
 
 ```
-new paper in Zotero  ──Job 1──▶  Drive/SuperNote/INBOX   ──▶ read + annotate on Nomad
-                                                                      │ export
-Zotero item (original + annotated)  ◀──Job 2──  Drive/SuperNote/EXPORT ◀┘
+new paper in Zotero  ──push──▶  SuperNote/INBOX   ──▶ read + annotate on Nomad
+                                                                  │ export
+Zotero item (original + annotated)  ◀──pull──  SuperNote/EXPORT ◀┘
 ```
 
-The exported file keeps the **same filename** as the original. Job 1 records
-`filename → parent-item-key`, so Job 2 always knows which item the returned
+```
+nomada config   # prompt for settings, saved to ~/.config/nomada/config.toml
+nomada push     # copy papers tagged "new" to INBOX; tag them "inreview"
+nomada pull     # attach annotated PDFs from EXPORT to their items; tag them "reviewed"
+nomada sync     # pull, then push
+nomada status   # show folders, in-flight papers, tag counts, Zotero connectivity
+```
+
+The exported file keeps the **same filename** as the original. `push` records
+`filename → parent-item-key`, so `pull` always knows which item the returned
 file belongs to.
 
-## What changed for Zotero 9
+## Pipeline tags
 
-- **Job 1 (read) is unchanged.** The local API `?since=` read path and the
-  `~/Zotero/storage/<KEY>/` layout are identical on Zotero 9. The local API is
-  still **read-only**, which is fine — Job 1 only reads.
-- **Job 2 (write) is fully local by default.** It uses the **Local Write API**
-  add-on, so no Zotero account or cloud storage is involved. (The debug-bridge
-  route I originally planned is broken on Zotero 8/9 and has been dropped.) A
-  `webapi` backend is still available if you'd rather use your online account.
-- **Native citation keys.** Zotero 8/9 added a built-in citekey field (it
-  replaced Better BibTeX's). Doesn't affect these scripts, but it's the easy way
-  to keep attachment filenames unique — see *Things to know*.
+You queue a paper by tagging it `new` in Zotero. `push` moves the tag to
+`inreview` when it copies the PDF out, and `pull` moves it to `reviewed` when
+the annotated copy comes back. Only one of these tags is on an item at a time;
+your other tags are never touched. The tag names are configurable. Tagging
+always goes through the Local Write API add-on (below), whichever write backend
+you pick.
 
-## Write backends (Job 2)
+## Write backends (`pull`)
 
-Set `WRITE_BACKEND` in `config.py`:
-
-**`localwrite`  (default — fully local, no credentials)**
+**`localwrite` (default; fully local, no credentials)**
 Uses the **Local Write API** add-on
 (github.com/dzackgarza/zotero-local-write-api). It adds an `/attach` endpoint to
 Zotero's local server that takes the PDF as bytes, so nothing leaves your
-machine and the annotated file can sit anywhere (your Drive folder is fine).
-No account, no API key, no storage quota. You just need Zotero running with the
-add-on installed.
+machine and the annotated file can sit anywhere. You just need Zotero running
+with the add-on installed.
 
-> Heads-up: this add-on is small and only *tested* against Zotero 8.0.1, but its
-> version range is open-ended (`strict_max_version: *`), so it installs on
-> Zotero 9. Step 4 below has you confirm it actually loads before relying on it.
-> It registers unauthenticated write endpoints on localhost — fine on a personal
-> machine, but worth knowing.
+> The add-on is only *tested* against Zotero 8.0.1, but its version range is
+> open-ended, so it installs on Zotero 9; `nomada status` confirms it loads. It
+> registers unauthenticated write endpoints on localhost, which is fine on a
+> personal machine but worth knowing.
 
-**`webapi`  (alternative — needs a Zotero account)**
-Uses the official Zotero Web API. Needs sync **on**, your numeric `ZOTERO_USER_ID`,
-and a `ZOTERO_API_KEY` with library write access
+**`webapi` (needs a Zotero account)**
+Uses the official Zotero Web API. Needs sync **on**, your numeric Zotero user
+ID, and an API key with library write access
 (https://www.zotero.org/settings/keys). Uploaded PDFs use zotero.org storage
-quota. Pick this only if you'd rather not install the add-on.
+quota.
 
 ## Setup
 
-1. **Install uv** (if you don't have it) and put the folder in your home dir:
+1. **Install uv** and make `nomada` available on your `PATH`:
    ```sh
    curl -LsSf https://astral.sh/uv/install.sh | sh
-   mv ~/Downloads/zotero-nomad ~/zotero-nomad
+   ln -s ~/zotero-nomad/nomada ~/.local/bin/nomada
    ```
-   That's the whole install. Each script declares its own dependencies in a
-   header block, so `uv run` builds (and caches) the right environment on the
-   fly — there's no venv to create and nothing to `pip install`.
+   `nomada` is a single file that declares its own dependencies, so `uv`
+   builds (and caches) its environment on the first run. Python ≥ 3.11 is
+   required; uv will fetch one if needed.
 
-2. **Edit `config.py`** — Drive paths (replace the e-mail in the
-   `GoogleDrive-…` path), pick `WRITE_BACKEND`, and fill in the credentials for
-   the backend you chose.
-
-3. **Enable the Zotero local API** (needed by Job 1)
+2. **Enable the Zotero local API** (needed by `push` and `status`):
    Settings → Advanced → *Allow other applications on this computer to
    communicate with Zotero.*
 
-4. **Set up the write backend**
-   *Default (`localwrite`):* download the latest `.xpi` from
+3. **Install the Local Write API add-on**: download the latest `.xpi` from
    github.com/dzackgarza/zotero-local-write-api/releases, then in Zotero:
-   Tools → Plugins → gear icon → *Install Plugin From File…* → pick the `.xpi`.
-   Restart Zotero. Then confirm it loaded on your Zotero 9:
+   Tools → Plugins → gear icon → *Install Plugin From File…*. Restart Zotero.
+
+4. **Configure**:
    ```sh
-   cd ~/zotero-nomad
-   uv run --with requests writers.py
+   nomada config
+   nomada status
    ```
-   You want to see `OK - ready to attach.` If instead it says "NOT reachable",
-   the add-on didn't load — check Tools → Plugins shows it enabled and that
-   Zotero is running.
+   `status` exits with an error and marks the problem if a folder is missing
+   or Zotero or the add-on can't be reached.
 
-   *Alternative (`webapi`):* turn on Zotero sync, create an API key, and set
-   `ZOTERO_USER_ID` + `ZOTERO_API_KEY` in `config.py`.
-
-5. **Install the launch agents**
-   In both `.plist` files replace `USERNAME`, the Drive e-mail, and the `uv`
-   path (run `which uv` to find it — usually `~/.local/bin/uv`), then:
+5. **Optional: run automatically with launchd.** In both `.plist` files
+   replace `USERNAME`, the Drive path in `WatchPaths`, and the `uv` path (run
+   `which uv`), then:
    ```sh
+   mkdir -p ~/.local/state/nomada
    cp com.user.zotero-nomad-*.plist ~/Library/LaunchAgents/
    launchctl load -w ~/Library/LaunchAgents/com.user.zotero-nomad-inbox.plist
    launchctl load -w ~/Library/LaunchAgents/com.user.zotero-nomad-import.plist
    ```
-   (To stop: `launchctl unload ~/Library/LaunchAgents/<label>.plist`.)
+   The `inbox` agent runs `nomada push` every 3 minutes; the `import` agent
+   runs `nomada pull` when EXPORT changes and every 5 minutes as a fallback.
+   To stop one: `launchctl unload ~/Library/LaunchAgents/<label>.plist`.
 
-   Prefer cron? One line does the same as Job 1's timer:
-   ```
-   */3 * * * * cd ~/zotero-nomad && ~/.local/bin/uv run --quiet zotero_to_inbox.py
-   ```
+## Files
 
-6. **Check it's alive**
-   ```sh
-   cd ~/zotero-nomad
-   uv run zotero_to_inbox.py     # first run: prints "initialised checkpoint"
-   tail -f ~/.zotero-nomad/zotero-nomad.log
-   ```
+| what   | where |
+|--------|-------|
+| config | `$XDG_CONFIG_HOME/nomada/config.toml` (default `~/.config/nomada/`) |
+| state  | `$XDG_STATE_HOME/nomada/state.json` (default `~/.local/state/nomada/`) |
+| log    | `$XDG_STATE_HOME/nomada/nomada.log` |
+
+The config file is written with owner-only permissions because it can hold an
+API key.
 
 ## Things to know
 
-- **Zotero must be running** for Job 1 (local API) and for the `localwrite`
-  backend (the add-on lives inside the app). The `webapi` backend works whether
-  or not the desktop app is open, as long as the item has synced. Both jobs
-  no-op quietly when they can't reach what they need.
-- **Filenames must be unique** across papers — the match relies on it. Letting
-  Zotero's native citekey (or Better BibTeX) drive a rename pattern is the clean
-  way to guarantee that. Job 1 copies whatever the stored filename is, so the
-  round-trip stays consistent; two papers literally named `paper.pdf` collide.
+- **Errors are reported, not skipped silently.** `push` and `pull` report each
+  paper they can't handle (no stored PDF, unknown export, failed attach or
+  tag), carry on with the others, and exit with status 1. If Zotero, INBOX, or
+  EXPORT is unavailable, they stop immediately with status 1.
+- **Zotero must be running** for `push`, for tagging, and for the `localwrite`
+  backend. The `webapi` backend can attach while the desktop app is closed, as
+  long as the item has synced, but tagging still needs the app.
+- **Filenames must be unique** across papers, because `pull` matches by
+  filename. `push` refuses to send a paper whose filename matches another
+  in-flight paper. Letting Zotero's native citekey drive a rename pattern
+  guarantees uniqueness.
+- **Deletion is soft.** `pull` moves the INBOX original to `INBOX/_archived` and
+  the handled export to `EXPORT/_processed`.
 - **Google Drive for desktop in *mirror* mode** is what makes `WatchPaths`
-  reliable; streaming/File-Provider mode may not emit local FS events, which is
-  why Job 2 also has a 5-minute safety-net timer.
-- **Deletion is soft.** Step 5 moves the INBOX original to `INBOX/_archived`.
-  To hard-delete instead, see the marked line in `export_to_zotero.py`.
-- **First-run flood guard.** Job 1 won't copy your whole library; it starts
-  acting only on papers added after the first run.
-- **`localwrite` troubleshooting:** if attaching fails, run
-  `uv run --with requests writers.py` to check the add-on. `OK - ready to
-  attach.` means it's good; "NOT reachable" means the add-on isn't loaded or
-  Zotero isn't running. After a Zotero update, re-run this — a major Zotero
-  version could in principle stop the add-on loading.
-
-> First time you run a script, uv resolves and caches its dependencies, so that
-> run is a few seconds slower; every run after is instant.
+  reliable; streaming mode may not emit local file-system events, which is why
+  the `import` agent also runs on a timer.
