@@ -439,8 +439,8 @@ def run_pull(cfg: Config) -> int:
 
         inbox_file = cfg.inbox_dir / name
         if inbox_file.exists():
-            shutil.move(inbox_file, cfg.archive_dir / name)
-        shutil.move(pdf, cfg.processed_dir / name)
+            move_unique(inbox_file, cfg.archive_dir)
+        move_unique(pdf, cfg.processed_dir)
         del fmap[name]
         save_state(state)
 
@@ -454,6 +454,18 @@ def is_complete_pdf(path: Path) -> bool:
         f.seek(0, os.SEEK_END)
         f.seek(max(0, f.tell() - 1024))
         return b"%%EOF" in f.read()
+
+
+def move_unique(src: Path, dest_dir: Path) -> Path:
+    """Move `src` into `dest_dir`, adding a timestamp to the name if it is taken."""
+    dest = dest_dir / src.name
+    if dest.exists():
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        dest = dest_dir / f"{src.stem} {stamp}{src.suffix}"
+        if dest.exists():
+            raise FileExistsError(f"can't move {src}: {dest} already exists")
+    shutil.move(src, dest)
+    return dest
 
 
 def finish(failures: int) -> None:
