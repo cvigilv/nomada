@@ -36,6 +36,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import tomllib
 from dataclasses import dataclass
 from datetime import datetime
@@ -52,6 +53,7 @@ APP = "nomada"
 LOCAL_BASE = "http://127.0.0.1:23119"
 LOCAL_LIBRARY_ID = "0"  # the local API serves the user's own library as id 0
 BACKENDS = ("localwrite", "webapi")
+SETTLE_SECONDS = 60  # an EXPORT file modified more recently may still be syncing
 
 
 def _xdg_dir(var: str, fallback: str) -> Path:
@@ -409,6 +411,15 @@ def run_pull(cfg: Config) -> int:
             failures += 1
             continue
 
+        age = time.time() - pdf.stat().st_mtime
+        if age < SETTLE_SECONDS:
+            log(job, f"'{name}' changed {age:.0f} s ago and may still be syncing; skipped", persist=False)
+            continue
+        if not is_complete_pdf(pdf):
+            log(job, f"'{name}' has no PDF end-of-file marker; it may be truncated", error=True)
+            failures += 1
+            continue
+
         try:
             result = attach(cfg, key, pdf)
         except WriteError as e:
@@ -435,6 +446,14 @@ def run_pull(cfg: Config) -> int:
 
     log(job, f"imported {imported} annotated paper(s) into Zotero", persist=imported > 0)
     return failures
+
+
+def is_complete_pdf(path: Path) -> bool:
+    """True if the file's last KiB holds the PDF end-of-file marker."""
+    with path.open("rb") as f:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - 1024))
+        return b"%%EOF" in f.read()
 
 
 def finish(failures: int) -> None:
