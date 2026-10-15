@@ -612,7 +612,16 @@ def status() -> None:
     if not cfg.storage_dir.is_dir():
         rows.append(("storage", f"{cfg.storage_dir}  (MISSING)"))
         ok = False
-    rows.append(("in flight", f"{len(load_state()['map'])} paper(s) pushed and not yet pulled"))
+    fmap = load_state()["map"]
+    rows.append(("in flight", f"{len(fmap)} paper(s) pushed and not yet pulled"))
+    # Listed after the table; neither affects the exit status.
+    lists: list[tuple[str, list[str]]] = []
+    if cfg.inbox_dir.is_dir():
+        gone = sorted(n for n in fmap if not (cfg.inbox_dir / n).exists())
+        lists.append(("In flight but no longer in INBOX", gone))
+    if cfg.export_dir.is_dir():
+        unmatched = sorted(p.name for p in cfg.export_dir.glob("*.pdf") if p.name not in fmap)
+        lists.append(("PDFs in EXPORT that match no pushed paper", unmatched))
 
     try:
         zot = local_zotero()
@@ -639,6 +648,11 @@ def status() -> None:
         ok = False
 
     show()
+    for title, names in lists:
+        if names:
+            click.echo(f"\n{title} ({len(names)}):")
+            for n in names:
+                click.echo(f"  {n}")
     if not ok:
         sys.exit(1)
 
