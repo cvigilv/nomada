@@ -104,4 +104,19 @@ API key.
   in-flight paper. Letting Zotero's native citekey drive a rename pattern
   guarantees uniqueness.
 - **Deletion is soft.** `pull` moves the INBOX original to `INBOX/_archived` and
-  the handled export to `EXPORT/_processed`.
+  the handled export to `EXPORT/_processed`, adding a timestamp to the name if
+  an earlier copy is already there.
+- **Exports need a minute to settle.** `pull` skips a PDF modified less than 60
+  seconds ago, since the sync client may still be writing it, and reports a
+  PDF without an end-of-file marker as possibly truncated.
+- **One run at a time.** `push`, `pull`, and `sync` lock the state file; a
+  second run started meanwhile exits with status 1.
+
+## Development
+
+Dependencies are pinned in `nomada.lock`; after editing the script's
+dependency block, run `uv lock --script nomada`. Run the tests with:
+
+```sh
+uv run --no-project --with pytest --with click --with pyzotero --with requests --with tomli-w pytest tests/
+```
