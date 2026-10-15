@@ -91,9 +91,11 @@ API key.
 ## Things to know
 
 - **Errors are reported, not skipped silently.** `push` and `pull` report each
-  paper they can't handle (no stored PDF, unknown export, failed attach or
-  tag), carry on with the others, and exit with status 1. If Zotero, INBOX, or
-  EXPORT is unavailable, they stop immediately with status 1.
+  paper they can't handle (no stored PDF, failed attach or tag), carry on with
+  the others, and exit with status 1. If Zotero, INBOX, or EXPORT is
+  unavailable, they stop immediately with status 1.
+- **`pull` only handles papers that `push` sent.** Other PDFs in EXPORT, such
+  as exported notebooks, are left alone; `nomada status` lists them.
 - **Zotero must be running** for `push`, for tagging, and for the `localwrite`
   backend. The `webapi` backend can attach while the desktop app is closed, as
   long as the item has synced, but tagging still needs the app.

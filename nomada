@@ -406,14 +406,13 @@ def run_pull(cfg: Config) -> int:
 
     state = load_state()
     fmap = state["map"]
-    failures = imported = 0
+    failures = imported = unmatched = 0
     for pdf in sorted(cfg.export_dir.glob("*.pdf")):
         name = pdf.name
         key = fmap.get(name)
+        # Exports that `push` did not send (e.g. notebooks) are not ours to handle.
         if not key:
-            log(job, f"no Zotero item recorded for '{name}'; left in EXPORT "
-                     "(was it sent with `nomada push`? are attachment filenames unique?)", error=True)
-            failures += 1
+            unmatched += 1
             continue
 
         age = time.time() - pdf.stat().st_mtime
@@ -449,6 +448,8 @@ def run_pull(cfg: Config) -> int:
         del fmap[name]
         save_state(state)
 
+    if unmatched:
+        log(job, f"skipped {unmatched} PDF(s) in EXPORT that match no pushed paper; see `nomada status`", persist=False)
     log(job, f"imported {imported} annotated paper(s) into Zotero", persist=imported > 0)
     return failures
 
