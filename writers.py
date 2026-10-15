@@ -44,6 +44,36 @@ def probe(base: str = LOCAL_BASE) -> dict:
     return r.json()
 
 
+# --- pipeline state tags (Local Write API /write) ---------------------------
+
+def _post_write(payload: dict) -> dict:
+    try:
+        r = requests.post(f"{LOCAL_BASE}/write", json=payload, timeout=30)
+    except requests.exceptions.ConnectionError as e:
+        raise WriteError(f"can't reach Zotero's local server ({e})")
+    if r.status_code == 404:
+        raise WriteError("/write not found - Local Write API add-on not loaded?")
+    r.raise_for_status()
+    res = r.json()
+    if not res.get("success"):
+        raise WriteError(f"write failed: {res}")
+    return res
+
+
+def set_pipeline_state(item_key: str, target: str) -> None:
+    """Move an item to exactly one of the pipeline state tags.
+
+    Removes the other pipeline tags and adds `target`. Other (topic) tags on the
+    item are left alone. No-op if USE_TAGS is off.
+    """
+    if not C.USE_TAGS:
+        return
+    others = [t for t in C.PIPELINE_TAGS if t != target]
+    if others:
+        _post_write({"operation": "remove_item_tags", "item_key": item_key, "tags": others})
+    _post_write({"operation": "add_item_tags", "item_key": item_key, "tags": [target]})
+
+
 def _write_localwrite(parent_key: str, file_path: Path) -> str:
     payload = {
         "item_key": parent_key,

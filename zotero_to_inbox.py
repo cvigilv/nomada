@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["pyzotero"]
+# dependencies = ["pyzotero", "requests"]
 # ///
 """
-Job 1 - Zotero -> SuperNote INBOX  (Zotero 9)
+Job 1 - Zotero -> SuperNote INBOX  (Zotero 9, tag-driven)
 
-Unchanged from earlier Zotero versions: the local API's ?since= read path and
-the ~/Zotero/storage/<KEY>/<file> layout are the same on Zotero 9.
+You queue a paper by tagging it "new" in Zotero. This job:
+  1. finds items tagged "new"
+  2. copies the original PDF to the Drive INBOX
+  3. advances the tag "new" -> "inreview"
+  4. records filename -> parent-item-key so Job 2 can find it on the way back
 
-Runs on a timer. Asks the read-only local Zotero API which items changed since
-the last run, finds each item's PDF on disk, copies it into the Drive INBOX,
-and records  filename -> parent-item-key  so Job 2 can put the annotated copy
-back on the right item.
-
-First run only sets a checkpoint and copies nothing, so you don't dump your
-entire back-catalogue onto the Nomad.
+Only "new"-tagged papers are ever touched, so nothing gets sent by accident
+(e.g. just from being re-added to a collection).
 """
 import json
 import shutil
@@ -24,6 +22,7 @@ from datetime import datetime
 from pyzotero import zotero
 
 import config as C
+from writers import set_pipeline_state, WriteError
 
 
 def log(msg: str) -> None:
@@ -37,7 +36,7 @@ def log(msg: str) -> None:
 def load_state() -> dict:
     if C.STATE_FILE.exists():
         return json.loads(C.STATE_FILE.read_text())
-    return {"version": None, "map": {}}
+    return {"map": {}}
 
 
 def save_state(state: dict) -> None:
@@ -45,10 +44,24 @@ def save_state(state: dict) -> None:
     C.STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
+def is_annotated(cd: dict) -> bool:
+    """True if this attachment is an annotated copy our pipeline created."""
+    title = cd.get("title") or ""
+    fname = cd.get("filename") or ""
+    if title == C.ANNOTATED_TITLE:
+        return True
+    if fname.startswith("local-write-api-"):
+        return True
+    suffix = C.ANNOTATED_SUFFIX.strip()
+    if suffix and suffix in fname:
+        return True
+    return False
+
+
 def main() -> None:
     try:
         zot = zotero.Zotero(C.ZOTERO_LIBRARY_ID, "user", local=True)
-        current_version = zot.last_modified_version()
+        queued = zot.everything(zot.top(tag=C.TAG_NEW))
     except Exception as e:
         log(f"local API unreachable (is Zotero running?): {e}")
         return
@@ -57,67 +70,47 @@ def main() -> None:
     state.setdefault("map", {})
     C.INBOX.mkdir(parents=True, exist_ok=True)
 
-    # First run: remember where we are, copy nothing.
-    if state.get("version") is None:
-        state["version"] = current_version
-        save_state(state)
-        log(f"initialised checkpoint at library version {current_version}; "
-            f"papers added from now on will sync")
-        return
-
-    since = state["version"]
-    try:
-        changed = zot.items(since=since)
-    except Exception as e:
-        log(f"items(since={since}) failed: {e}")
-        return
-
-    # Collect parent items to inspect: top-level items that changed, plus the
-    # parents of any attachments that changed (covers 'added a PDF later').
-    parent_keys = set()
-    for it in changed:
-        d = it["data"]
-        itype = d.get("itemType")
-        if itype == "note":
-            continue
-        if itype == "attachment":
-            pk = d.get("parentItem")
-            if pk:
-                parent_keys.add(pk)
-            continue
-        parent_keys.add(it["key"])
-
     copied = 0
-    for pk in parent_keys:
+    for it in queued:
+        pk = it["key"]
         try:
             children = zot.children(pk)
         except Exception as e:
             log(f"children({pk}) failed: {e}")
             continue
-        for ch in children:
-            cd = ch["data"]
-            if cd.get("contentType") != "application/pdf":
-                continue
-            if cd.get("linkMode") not in ("imported_file", "imported_url"):
-                continue
-            fname = cd.get("filename")
-            if not fname:
-                continue
-            src = C.ZOTERO_STORAGE / ch["key"] / fname
-            dst = C.INBOX / fname
-            if not src.exists():
-                log(f"stored file missing on disk: {src}")
-                continue
-            # Always (re)record the mapping so Job 2 can find the parent.
-            state["map"][fname] = pk
-            if dst.exists():
-                continue
+
+        # Candidate originals = PDFs that are not our own annotated copies.
+        originals = [
+            ch for ch in children
+            if ch["data"].get("contentType") == "application/pdf"
+            and ch["data"].get("linkMode") in ("imported_file", "imported_url")
+            and ch["data"].get("filename")
+            and not is_annotated(ch["data"])
+        ]
+        if not originals:
+            log(f"item {pk} tagged '{C.TAG_NEW}' has no original PDF - skipping")
+            continue
+
+        ch = originals[0]
+        fname = ch["data"]["filename"]
+        src = C.ZOTERO_STORAGE / ch["key"] / fname
+        dst = C.INBOX / fname
+        if not src.exists():
+            log(f"stored file missing on disk: {src}")
+            continue
+
+        state["map"][fname] = pk
+        if not dst.exists():
             shutil.copy2(src, dst)
             copied += 1
             log(f"-> INBOX  {fname}   (item {pk})")
-            break  # one PDF per item is enough
 
-    state["version"] = current_version
+        # Advance the state tag: new -> inreview.
+        try:
+            set_pipeline_state(pk, C.TAG_INREVIEW)
+        except WriteError as e:
+            log(f"tagging '{C.TAG_INREVIEW}' failed for {pk} (non-fatal): {e}")
+
     save_state(state)
     if copied:
         log(f"copied {copied} new paper(s) to INBOX")

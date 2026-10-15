@@ -21,7 +21,7 @@ import shutil
 from datetime import datetime
 
 import config as C
-from writers import write_attachment, WriteError
+from writers import write_attachment, set_pipeline_state, WriteError
 
 
 def log(msg: str) -> None:
@@ -72,6 +72,12 @@ def main() -> None:
             continue
 
         log(f"attached '{name}' -> item {parent_key}  ({C.WRITE_BACKEND}: {result})")
+
+        # Advance the state tag: inreview -> reviewed.
+        try:
+            set_pipeline_state(parent_key, C.TAG_REVIEWED)
+        except WriteError as e:
+            log(f"tagging '{C.TAG_REVIEWED}' failed for {parent_key} (non-fatal): {e}")
 
         # Step 5: the original is now redundant in the INBOX. Archive it.
         # To hard-delete instead, replace the move() below with: inbox_file.unlink()

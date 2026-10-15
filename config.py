@@ -36,6 +36,19 @@ ZOTERO_USER_ID = os.environ.get("ZOTERO_USER_ID", "REDACTED")   # numeric: zoter
 ZOTERO_API_KEY = os.environ.get("ZOTERO_API_KEY", "REDACTED")   # needs library write access
 
 # ---------------------------------------------------------------------------
+# Pipeline state tags  (requires the localwrite add-on)
+# ---------------------------------------------------------------------------
+# You tag a paper TAG_NEW to queue it for the Nomad. Job 1 then advances it to
+# TAG_INREVIEW when it copies it out, and Job 2 advances it to TAG_REVIEWED when
+# the annotated copy comes back. Only ONE of these is ever on an item at a time;
+# your own topic tags are never touched.
+USE_TAGS      = True
+TAG_NEW       = "new"
+TAG_INREVIEW  = "inreview"
+TAG_REVIEWED  = "reviewed"
+PIPELINE_TAGS = (TAG_NEW, TAG_INREVIEW, TAG_REVIEWED)
+
+# ---------------------------------------------------------------------------
 # Paths  (EDIT THESE)
 # ---------------------------------------------------------------------------
 # "Google Drive for desktop" mounts here on macOS. Replace the e-mail.
