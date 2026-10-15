@@ -10,11 +10,10 @@
         <string>/Users/USERNAME/.local/bin/uv</string>
         <string>run</string>
         <string>--quiet</string>
-        <string>/Users/USERNAME/zotero-nomad/export_to_zotero.py</string>
+        <string>--script</string>
+        <string>/Users/USERNAME/zotero-nomad/nomada</string>
+        <string>pull</string>
     </array>
-
-    <key>WorkingDirectory</key>
-    <string>/Users/USERNAME/zotero-nomad</string>
 
     <!-- Fire when something lands in EXPORT (mirror-mode Drive emits FS events) -->
     <key>WatchPaths</key>
@@ -30,8 +29,8 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/Users/USERNAME/.zotero-nomad/import.out.log</string>
+    <string>/Users/USERNAME/.local/state/nomada/import.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/USERNAME/.zotero-nomad/import.err.log</string>
+    <string>/Users/USERNAME/.local/state/nomada/import.err.log</string>
 </dict>
 </plist>

@@ -10,12 +10,10 @@
         <string>/Users/USERNAME/.local/bin/uv</string>
         <string>run</string>
         <string>--quiet</string>
-        <string>/Users/USERNAME/zotero-nomad/zotero_to_inbox.py</string>
+        <string>--script</string>
+        <string>/Users/USERNAME/zotero-nomad/nomada</string>
+        <string>push</string>
     </array>
-
-    <!-- Working dir so 'import config' resolves -->
-    <key>WorkingDirectory</key>
-    <string>/Users/USERNAME/zotero-nomad</string>
 
     <key>StartInterval</key>
     <integer>180</integer>
@@ -24,8 +22,8 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/Users/USERNAME/.zotero-nomad/inbox.out.log</string>
+    <string>/Users/USERNAME/.local/state/nomada/inbox.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/USERNAME/.zotero-nomad/inbox.err.log</string>
+    <string>/Users/USERNAME/.local/state/nomada/inbox.err.log</string>
 </dict>
 </plist>
