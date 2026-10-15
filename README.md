@@ -130,3 +130,7 @@ Only your user can read the config file, because it can hold an API key.
 `nomada.lock` pins the dependencies. After editing the script's dependency
 block, run `uv lock --script nomada`; the installed wrapper refuses to run
 while the lock is out of date. Run the tests with `make test`.
+
+## LLM disclosure
+
+I did that work with the help of an AI coding agent. I directed it, reviewed it, and am responsible for the result. The agent assisted me, not the other way around. For that reason my commits credit the agent with an Assisted-by: trailer instead of Co-authored-by:. No LLM provider is an author of these commits or accountable for them.
