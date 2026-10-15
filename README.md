@@ -48,14 +48,20 @@ three tags, and their names are configurable.
 
 ## Setup
 
-1. Install [uv](https://docs.astral.sh/uv/) and put `nomada` on your `PATH`:
+1. Install [uv](https://docs.astral.sh/uv/), then install `nomada` from this
+   directory:
    ```sh
    curl -LsSf https://astral.sh/uv/install.sh | sh
-   ln -s ~/zotero-nomad/nomada ~/.local/bin/nomada
+   make install
    ```
+   This puts a small `nomada` wrapper in `~/.local/bin`. Set `BINDIR` to use
+   another directory, as in `make install BINDIR=/usr/local/bin`. The wrapper
+   runs the script from this checkout, so keep the checkout where it is, and
+   `git pull` updates the installed command. `make uninstall` removes it.
+
    `nomada` is a single script that declares its own dependencies. uv builds
-   and caches its environment on the first run, and fetches Python 3.11 or
-   newer if needed.
+   and caches its environment on the first run, using the versions pinned in
+   `nomada.lock`, and fetches Python 3.11 or newer if needed.
 
 2. In Zotero, enable the local API under Settings → Advanced → *Allow other
    applications on this computer to communicate with Zotero*.
@@ -122,8 +128,5 @@ Only your user can read the config file, because it can hold an API key.
 ## Development
 
 `nomada.lock` pins the dependencies. After editing the script's dependency
-block, run `uv lock --script nomada`. To run the tests:
-
-```sh
-uv run --no-project --with pytest --with click --with pyzotero --with requests --with tomli-w pytest tests/
-```
+block, run `uv lock --script nomada`; the installed wrapper refuses to run
+while the lock is out of date. Run the tests with `make test`.
