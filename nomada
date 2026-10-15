@@ -1,0 +1,590 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "click>=8.1",
+#     "pyzotero>=1.5",
+#     "requests>=2.28",
+#     "tomli-w>=1.0",
+# ]
+# ///
+"""nomada: move papers between Zotero and a SuperNote Nomad through a synced folder.
+
+    new paper in Zotero  --push-->  SuperNote/INBOX   --> read + annotate on Nomad
+                                                                  | export
+    Zotero item (original + annotated)  <--pull--  SuperNote/EXPORT <-+
+
+`push` copies the PDF of every Zotero item tagged `tag_new` into INBOX, records
+filename -> item key, and moves the item's tag to `tag_inreview`. `pull`
+attaches each PDF found in EXPORT to the item recorded under the same filename,
+moves the tag to `tag_reviewed`, archives the INBOX original into
+INBOX/_archived, and moves the export into EXPORT/_processed.
+
+Reading uses Zotero's local API. Tagging, and attaching with the "localwrite"
+backend, use the Local Write API add-on
+(github.com/dzackgarza/zotero-local-write-api). The "webapi" backend attaches
+through the Zotero Web API instead.
+"""
+from __future__ import annotations
+
+import base64
+import dataclasses
+import json
+import os
+import shutil
+import sys
+import tempfile
+import tomllib
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import NoReturn
+
+import click
+import requests
+import tomli_w
+
+__version__ = "0.1.0"
+
+APP = "nomada"
+LOCAL_BASE = "http://127.0.0.1:23119"
+LOCAL_LIBRARY_ID = "0"  # the local API serves the user's own library as id 0
+BACKENDS = ("localwrite", "webapi")
+
+
+def _xdg_dir(var: str, fallback: str) -> Path:
+    # The XDG Base Directory spec requires ignoring relative values.
+    value = os.environ.get(var, "")
+    base = Path(value) if os.path.isabs(value) else Path.home() / fallback
+    return base / APP
+
+
+CONFIG_FILE = _xdg_dir("XDG_CONFIG_HOME", ".config") / "config.toml"
+STATE_DIR = _xdg_dir("XDG_STATE_HOME", ".local/state")
+STATE_FILE = STATE_DIR / "state.json"
+LOG_FILE = STATE_DIR / "nomada.log"
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Config:
+    inbox: str
+    export: str
+    zotero_storage: str = "~/Zotero/storage"
+    write_backend: str = "localwrite"
+    zotero_user_id: str = ""  # webapi only
+    zotero_api_key: str = ""  # webapi only; needs library write access
+    annotated_title: str = "Annotated (SuperNote)"
+    annotated_suffix: str = " (annotated)"  # appended to the attached file's stem
+    tag_new: str = "new"
+    tag_inreview: str = "inreview"
+    tag_reviewed: str = "reviewed"
+
+    @property
+    def inbox_dir(self) -> Path:
+        return Path(self.inbox).expanduser()
+
+    @property
+    def export_dir(self) -> Path:
+        return Path(self.export).expanduser()
+
+    @property
+    def archive_dir(self) -> Path:
+        return self.inbox_dir / "_archived"
+
+    @property
+    def processed_dir(self) -> Path:
+        return self.export_dir / "_processed"
+
+    @property
+    def storage_dir(self) -> Path:
+        return Path(self.zotero_storage).expanduser()
+
+    @property
+    def pipeline_tags(self) -> tuple[str, str, str]:
+        return (self.tag_new, self.tag_inreview, self.tag_reviewed)
+
+
+FIELDS = {f.name: f for f in dataclasses.fields(Config)}
+
+
+def validate(cfg: Config) -> list[str]:
+    """Return a list of problems with `cfg` (empty if it is usable)."""
+    problems = []
+    if cfg.write_backend not in BACKENDS:
+        problems.append(f"write_backend must be one of {', '.join(BACKENDS)}, got {cfg.write_backend!r}")
+    if cfg.write_backend == "webapi" and not (cfg.zotero_user_id and cfg.zotero_api_key):
+        problems.append("write_backend 'webapi' needs zotero_user_id and zotero_api_key")
+    if not all(cfg.pipeline_tags) or len(set(cfg.pipeline_tags)) != 3:
+        problems.append("tag_new, tag_inreview, and tag_reviewed must be non-empty and distinct")
+    if not cfg.inbox or not cfg.export:
+        problems.append("inbox and export must be set")
+    return problems
+
+
+def read_config_file() -> dict:
+    try:
+        return tomllib.loads(CONFIG_FILE.read_text())
+    except tomllib.TOMLDecodeError as e:
+        raise click.ClickException(f"{CONFIG_FILE} is not valid TOML: {e}")
+
+
+def load_config() -> Config:
+    if not CONFIG_FILE.exists():
+        raise click.ClickException(f"no configuration found at {CONFIG_FILE}; run `nomada config`")
+    raw = read_config_file()
+    problems = [f"unknown key {k!r}" for k in raw if k not in FIELDS]
+    problems += [f"{k} must be a string" for k, v in raw.items() if k in FIELDS and not isinstance(v, str)]
+    problems += [
+        f"missing required key {name!r}"
+        for name, f in FIELDS.items()
+        if f.default is dataclasses.MISSING and name not in raw
+    ]
+    if not problems:
+        cfg = Config(**raw)
+        problems = validate(cfg)
+    if problems:
+        details = "".join(f"\n  - {p}" for p in problems)
+        raise click.ClickException(f"invalid configuration in {CONFIG_FILE}:{details}\nFix it by hand or rerun `nomada config`.")
+    return cfg
+
+
+def save_config(cfg: Config) -> None:
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # The file may hold an API key, so it is readable by the owner only.
+    _atomic_write(CONFIG_FILE, tomli_w.dumps(dataclasses.asdict(cfg)), mode=0o600)
+
+
+def _atomic_write(path: Path, text: str, mode: int = 0o644) -> None:
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def _existing_dir(value: str) -> str:
+    path = Path(value).expanduser().resolve()
+    if not path.is_dir():
+        raise click.UsageError(f"{path} is not an existing directory")
+    return str(path)
+
+
+# ---------------------------------------------------------------------------
+# Logging and state
+# ---------------------------------------------------------------------------
+
+def log(job: str, msg: str, *, error: bool = False, persist: bool = True) -> None:
+    """Report `msg` on stderr and, if `persist`, append it to LOG_FILE with a timestamp."""
+    click.echo(f"error: {msg}" if error else msg, err=True)
+    if persist:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        level = "ERROR " if error else ""
+        with LOG_FILE.open("a") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')} [{job}] {level}{msg}\n")
+
+
+def fail(job: str, msg: str) -> NoReturn:
+    log(job, msg, error=True)
+    raise click.ClickException(msg)
+
+
+def load_state() -> dict:
+    """State holds `map`: INBOX filename -> key of the Zotero item it came from."""
+    if not STATE_FILE.exists():
+        return {"map": {}}
+    state = json.loads(STATE_FILE.read_text())
+    state.setdefault("map", {})
+    return state
+
+
+def save_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(STATE_FILE, json.dumps(state, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Zotero access
+# ---------------------------------------------------------------------------
+
+class WriteError(Exception):
+    pass
+
+
+def local_zotero():
+    from pyzotero import zotero
+
+    return zotero.Zotero(LOCAL_LIBRARY_ID, "user", local=True)
+
+
+def _local_post(path: str, payload: dict, timeout: float) -> dict:
+    """POST to an endpoint of the Local Write API add-on and return its JSON reply."""
+    try:
+        r = requests.post(f"{LOCAL_BASE}{path}", json=payload, timeout=timeout)
+    except requests.RequestException as e:
+        raise WriteError(f"can't reach Zotero's local server at {LOCAL_BASE} (is Zotero running?): {e}") from e
+    if r.status_code == 404:
+        raise WriteError(f"{path} not found: the Local Write API add-on is not installed or did not load (check `nomada status`)")
+    if not r.ok:
+        raise WriteError(f"{path} returned HTTP {r.status_code}: {r.text[:500]}")
+    try:
+        res = r.json()
+    except ValueError as e:
+        raise WriteError(f"{path} returned a non-JSON reply: {r.text[:500]}") from e
+    if not res.get("success"):
+        raise WriteError(f"{path} failed: {res}")
+    return res
+
+
+def set_pipeline_state(cfg: Config, item_key: str, target: str) -> None:
+    """Leave `target` as the only pipeline tag on the item; other tags are untouched."""
+    others = [t for t in cfg.pipeline_tags if t != target]
+    _local_post("/write", {"operation": "remove_item_tags", "item_key": item_key, "tags": others}, timeout=30)
+    _local_post("/write", {"operation": "add_item_tags", "item_key": item_key, "tags": [target]}, timeout=30)
+
+
+def annotated_name(cfg: Config, pdf: Path) -> str:
+    return f"{pdf.stem}{cfg.annotated_suffix}{pdf.suffix}"
+
+
+def is_annotated(cfg: Config, data: dict) -> bool:
+    """True if this attachment is an annotated copy created by `pull`."""
+    title = data.get("title") or ""
+    fname = data.get("filename") or ""
+    suffix = cfg.annotated_suffix.strip()
+    return (
+        title == cfg.annotated_title
+        or fname.startswith("local-write-api-")
+        or bool(suffix and suffix in fname)
+    )
+
+
+def _attach_localwrite(cfg: Config, parent_key: str, pdf: Path) -> str:
+    payload = {
+        "item_key": parent_key,
+        "title": cfg.annotated_title,
+        "file_name": annotated_name(cfg, pdf),
+        "file_bytes_base64": base64.b64encode(pdf.read_bytes()).decode("ascii"),
+    }
+    return _local_post("/attach", payload, timeout=120).get("attachment_key", "ok")
+
+
+def _attach_webapi(cfg: Config, parent_key: str, pdf: Path) -> str:
+    from pyzotero import zotero
+
+    zot = zotero.Zotero(cfg.zotero_user_id, "user", cfg.zotero_api_key)
+    try:
+        zot.item(parent_key)
+    except Exception as e:
+        raise WriteError(f"item {parent_key} not found on zotero.org (has it synced?): {e}") from e
+    with tempfile.TemporaryDirectory() as tmpdir:
+        upload = Path(tmpdir) / annotated_name(cfg, pdf)
+        shutil.copy2(pdf, upload)
+        try:
+            res = zot.attachment_simple([str(upload)], parent_key)
+        except Exception as e:
+            raise WriteError(f"upload to zotero.org failed: {e}") from e
+    if isinstance(res, dict) and res.get("failure"):
+        raise WriteError(f"upload to zotero.org failed: {res['failure']}")
+    return "ok"
+
+
+def attach(cfg: Config, parent_key: str, pdf: Path) -> str:
+    """Attach `pdf` to the Zotero item `parent_key`; return the new attachment key or "ok"."""
+    if cfg.write_backend == "localwrite":
+        return _attach_localwrite(cfg, parent_key, pdf)
+    return _attach_webapi(cfg, parent_key, pdf)
+
+
+# ---------------------------------------------------------------------------
+# Jobs. Each returns the number of papers that hit a problem; problems that
+# prevent the whole job from running raise click.ClickException instead.
+# ---------------------------------------------------------------------------
+
+def run_push(cfg: Config) -> int:
+    job = "push"
+    if not cfg.inbox_dir.is_dir():
+        fail(job, f"INBOX folder not found: {cfg.inbox_dir} (is the synced drive available?)")
+    zot = local_zotero()
+    try:
+        queued = zot.everything(zot.top(tag=cfg.tag_new))
+    except Exception as e:
+        fail(job, f"can't query Zotero's local API (is Zotero running, with local API access enabled?): {e}")
+
+    state = load_state()
+    fmap = state["map"]
+    failures = copied = 0
+    for item in queued:
+        key = item["key"]
+        try:
+            children = zot.children(key)
+        except Exception as e:
+            log(job, f"can't list attachments of item {key}: {e}", error=True)
+            failures += 1
+            continue
+
+        originals = [
+            ch for ch in children
+            if ch["data"].get("contentType") == "application/pdf"
+            and ch["data"].get("linkMode") in ("imported_file", "imported_url")
+            and ch["data"].get("filename")
+            and not is_annotated(cfg, ch["data"])
+        ]
+        if not originals:
+            log(job, f"item {key} is tagged '{cfg.tag_new}' but has no stored PDF", error=True)
+            failures += 1
+            continue
+
+        ch = originals[0]
+        fname = ch["data"]["filename"]
+        src = cfg.storage_dir / ch["key"] / fname
+        if not src.exists():
+            log(job, f"stored file for item {key} is missing: {src}", error=True)
+            failures += 1
+            continue
+        # `pull` matches exports to items by filename alone.
+        if fmap.get(fname, key) != key:
+            log(job, f"'{fname}' (item {key}) has the same filename as in-flight item {fmap[fname]}; rename one of them", error=True)
+            failures += 1
+            continue
+
+        fmap[fname] = key
+        dst = cfg.inbox_dir / fname
+        if not dst.exists():
+            shutil.copy2(src, dst)
+            copied += 1
+            log(job, f"-> INBOX  {fname}  (item {key})")
+
+        try:
+            set_pipeline_state(cfg, key, cfg.tag_inreview)
+        except WriteError as e:
+            log(job, f"can't tag item {key} '{cfg.tag_inreview}': {e}", error=True)
+            failures += 1
+
+    save_state(state)
+    log(job, f"copied {copied} paper(s) to INBOX", persist=copied > 0)
+    return failures
+
+
+def run_pull(cfg: Config) -> int:
+    job = "pull"
+    if not cfg.export_dir.is_dir():
+        fail(job, f"EXPORT folder not found: {cfg.export_dir} (is the synced drive available?)")
+    if not cfg.inbox_dir.is_dir():
+        fail(job, f"INBOX folder not found: {cfg.inbox_dir} (is the synced drive available?)")
+    cfg.processed_dir.mkdir(exist_ok=True)
+    cfg.archive_dir.mkdir(exist_ok=True)
+
+    state = load_state()
+    fmap = state["map"]
+    failures = imported = 0
+    for pdf in sorted(cfg.export_dir.glob("*.pdf")):
+        name = pdf.name
+        key = fmap.get(name)
+        if not key:
+            log(job, f"no Zotero item recorded for '{name}'; left in EXPORT "
+                     "(was it sent with `nomada push`? are attachment filenames unique?)", error=True)
+            failures += 1
+            continue
+
+        try:
+            result = attach(cfg, key, pdf)
+        except WriteError as e:
+            log(job, f"can't attach '{name}' to item {key}: {e}", error=True)
+            failures += 1
+            continue
+        log(job, f"<- EXPORT {name}  (item {key}, {cfg.write_backend}: {result})")
+        imported += 1
+
+        # The attachment exists now, so the files move on even if tagging
+        # fails; otherwise the next pull would attach the same PDF again.
+        try:
+            set_pipeline_state(cfg, key, cfg.tag_reviewed)
+        except WriteError as e:
+            log(job, f"can't tag item {key} '{cfg.tag_reviewed}': {e}", error=True)
+            failures += 1
+
+        inbox_file = cfg.inbox_dir / name
+        if inbox_file.exists():
+            shutil.move(inbox_file, cfg.archive_dir / name)
+        shutil.move(pdf, cfg.processed_dir / name)
+        del fmap[name]
+        save_state(state)
+
+    log(job, f"imported {imported} annotated paper(s) into Zotero", persist=imported > 0)
+    return failures
+
+
+def finish(failures: int) -> None:
+    if failures:
+        raise click.ClickException(f"{failures} paper(s) need attention; see the messages above or {LOG_FILE}")
+
+
+# ---------------------------------------------------------------------------
+# Command-line interface
+# ---------------------------------------------------------------------------
+
+@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+@click.version_option(__version__, "--version", prog_name=APP)
+def cli() -> None:
+    """Move papers between Zotero and a SuperNote Nomad.
+
+    Tag a paper in Zotero with your "new" tag and run `nomada push` to send its
+    PDF to the SuperNote INBOX folder. After exporting the annotated PDF on the
+    Nomad, run `nomada pull` to attach it to the original Zotero item.
+
+    \b
+    Examples:
+      nomada config     # first-time setup
+      nomada status     # check folders and Zotero connectivity
+      nomada sync       # pull annotated papers, then push new ones
+    """
+
+
+@cli.command()
+def config() -> None:
+    """Prompt for settings and save them to the config file.
+
+    Current values are offered as defaults. The file lives at
+    $XDG_CONFIG_HOME/nomada/config.toml (~/.config/nomada/config.toml).
+    """
+    if not sys.stdin.isatty():
+        raise click.ClickException("`nomada config` is interactive; run it in a terminal")
+    current = {}
+    if CONFIG_FILE.exists():
+        raw = read_config_file()
+        current = {k: v for k, v in raw.items() if k in FIELDS and isinstance(v, str)}
+        dropped = sorted(set(raw) - set(current))
+        if dropped:
+            click.echo(f"warning: dropping unknown or non-string keys: {', '.join(dropped)}", err=True)
+        click.echo(f"Updating {CONFIG_FILE}", err=True)
+    else:
+        click.echo(f"Creating {CONFIG_FILE}", err=True)
+
+    def ask(name: str, text: str, fallback: str | None = None, **kwargs):
+        default = current.get(name, FIELDS[name].default)
+        if default is dataclasses.MISSING:
+            default = fallback
+        return click.prompt(text, default=default, **kwargs)
+
+    values = {}
+    values["inbox"] = ask("inbox", "SuperNote INBOX folder", value_proc=_existing_dir)
+    values["export"] = ask("export", "SuperNote EXPORT folder", value_proc=_existing_dir,
+                           fallback=str(Path(values["inbox"]).parent / "EXPORT"))
+    values["zotero_storage"] = ask("zotero_storage", "Zotero storage folder", value_proc=_existing_dir)
+    values["write_backend"] = ask("write_backend", "Attach annotated PDFs with", type=click.Choice(BACKENDS))
+    if values["write_backend"] == "webapi":
+        values["zotero_user_id"] = ask("zotero_user_id", "Zotero user ID (zotero.org/settings/keys)")
+        values["zotero_api_key"] = ask("zotero_api_key", "Zotero API key with write access", hide_input=True)
+    else:
+        values["zotero_user_id"] = current.get("zotero_user_id", "")
+        values["zotero_api_key"] = current.get("zotero_api_key", "")
+    values["annotated_title"] = ask("annotated_title", "Title of the annotated attachment")
+    values["annotated_suffix"] = ask("annotated_suffix", "Suffix added to the annotated filename")
+    values["tag_new"] = ask("tag_new", "Tag that queues a paper for the Nomad")
+    values["tag_inreview"] = ask("tag_inreview", "Tag for papers on the Nomad")
+    values["tag_reviewed"] = ask("tag_reviewed", "Tag for papers with an annotated copy")
+
+    cfg = Config(**values)
+    problems = validate(cfg)
+    if problems:
+        details = "".join(f"\n  - {p}" for p in problems)
+        raise click.ClickException(f"configuration not saved:{details}")
+    save_config(cfg)
+    click.echo(f"Saved {CONFIG_FILE}. Run `nomada status` to check the setup.", err=True)
+
+
+@cli.command()
+def push() -> None:
+    """Copy papers tagged "new" in Zotero to the SuperNote INBOX."""
+    finish(run_push(load_config()))
+
+
+@cli.command()
+def pull() -> None:
+    """Attach annotated PDFs from the SuperNote EXPORT folder to their Zotero items."""
+    finish(run_pull(load_config()))
+
+
+@cli.command()
+def sync() -> None:
+    """Run `pull`, then `push`."""
+    cfg = load_config()
+    finish(run_pull(cfg) + run_push(cfg))
+
+
+@cli.command()
+def status() -> None:
+    """Show configuration, folder contents, and Zotero connectivity.
+
+    Exits with status 1 if anything that push or pull needs is missing.
+    """
+    ok = True
+    rows: list[tuple[str, str]] = [
+        ("version", __version__),
+        ("config", str(CONFIG_FILE)),
+        ("state", str(STATE_FILE)),
+        ("log", str(LOG_FILE)),
+    ]
+
+    def show() -> None:
+        width = max(len(k) for k, _ in rows)
+        for k, v in rows:
+            click.echo(f"{k:<{width}}  {v}")
+
+    if not CONFIG_FILE.exists():
+        rows.append(("setup", "not configured; run `nomada config`"))
+        show()
+        sys.exit(1)
+    cfg = load_config()
+    rows.append(("backend", cfg.write_backend))
+
+    for label, d in (("INBOX", cfg.inbox_dir), ("EXPORT", cfg.export_dir)):
+        if d.is_dir():
+            rows.append((label, f"{d}  ({len(list(d.glob('*.pdf')))} PDF(s))"))
+        else:
+            rows.append((label, f"{d}  (MISSING)"))
+            ok = False
+    if not cfg.storage_dir.is_dir():
+        rows.append(("storage", f"{cfg.storage_dir}  (MISSING)"))
+        ok = False
+    rows.append(("in flight", f"{len(load_state()['map'])} paper(s) pushed and not yet pulled"))
+
+    try:
+        zot = local_zotero()
+        counts = [f"{t}: {len(zot.everything(zot.top(tag=t)))}" for t in cfg.pipeline_tags]
+        rows.append(("local API", "reachable"))
+        rows.append(("tags", ", ".join(counts)))
+    except Exception as e:
+        rows.append(("local API", f"NOT reachable ({e})"))
+        ok = False
+
+    # Tagging always needs the Local Write API add-on, whichever backend attaches.
+    try:
+        r = requests.get(f"{LOCAL_BASE}/version", timeout=10)
+        r.raise_for_status()
+        info = r.json()
+        caps = info.get("capabilities", [])
+        detail = f"version {info.get('version', '?')}"
+        if cfg.write_backend == "localwrite" and "attach_bytes" not in caps:
+            detail += ", missing the attach_bytes capability"
+            ok = False
+        rows.append(("Local Write API", detail))
+    except (requests.RequestException, ValueError) as e:
+        rows.append(("Local Write API", f"NOT reachable ({e})"))
+        ok = False
+
+    show()
+    if not ok:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    cli()
