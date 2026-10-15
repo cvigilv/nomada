@@ -1,121 +1,128 @@
-# nomada: Zotero ⇄ SuperNote Nomad sync (Zotero 9)
+# nomada
 
-`nomada` moves papers between Zotero and a SuperNote Nomad through a synced
-folder (Google Drive, Insync, …):
+`nomada` sends papers from Zotero to a SuperNote Nomad for reading, then
+attaches the annotated PDFs back to the original Zotero items. The two sides
+exchange files through a folder that both can reach, such as Google Drive or
+Insync. Zotero tags record where each paper is. Tested with Zotero 9.
 
+## Workflow
+
+```mermaid
+flowchart LR
+    Z["Zotero"]
+    subgraph folder["Synced folder"]
+        I["SuperNote/INBOX"]
+        E["SuperNote/EXPORT"]
+    end
+    N["SuperNote Nomad"]
+
+    Z -- "nomada push<br/>tag new → inreview" --> I
+    I -. "cloud sync" .-> N
+    N -. "annotate and export" .-> E
+    E -- "nomada pull<br/>tag inreview → reviewed" --> Z
 ```
-new paper in Zotero  ──push──▶  SuperNote/INBOX   ──▶ read + annotate on Nomad
-                                                                  │ export
-Zotero item (original + annotated)  ◀──pull──  SuperNote/EXPORT ◀┘
-```
 
-```
-nomada config   # prompt for settings, saved to ~/.config/nomada/config.toml
-nomada push     # copy papers tagged "new" to INBOX; tag them "inreview"
-nomada pull     # attach annotated PDFs from EXPORT to their items; tag them "reviewed"
-nomada sync     # pull, then push
-nomada status   # show folders, in-flight papers, tag counts, Zotero connectivity
-```
+Solid arrows are `nomada` commands. Dashed arrows happen on the Nomad and in
+the sync client.
 
-The exported file keeps the **same filename** as the original. `push` records
-`filename → parent-item-key`, so `pull` always knows which item the returned
-file belongs to.
+1. Tag a paper `new` in Zotero.
+2. `nomada push` copies its PDF to INBOX and changes the tag to `inreview`.
+3. Read and annotate the paper on the Nomad, then export it to EXPORT. The
+   export keeps the original filename.
+4. `nomada pull` attaches the annotated PDF to the Zotero item it came from
+   and changes the tag to `reviewed`.
 
-## Pipeline tags
+`push` records which Zotero item each filename belongs to, and `pull` uses
+that record to match exports to items. `nomada` adds and removes only its own
+three tags, and their names are configurable.
 
-You queue a paper by tagging it `new` in Zotero. `push` moves the tag to
-`inreview` when it copies the PDF out, and `pull` moves it to `reviewed` when
-the annotated copy comes back. Only one of these tags is on an item at a time;
-your other tags are never touched. The tag names are configurable. Tagging
-always goes through the Local Write API add-on (below), whichever write backend
-you pick.
+## Commands
 
-## Write backends (`pull`)
-
-**`localwrite` (default; fully local, no credentials)**
-Uses the **Local Write API** add-on
-(github.com/dzackgarza/zotero-local-write-api). It adds an `/attach` endpoint to
-Zotero's local server that takes the PDF as bytes, so nothing leaves your
-machine and the annotated file can sit anywhere. You just need Zotero running
-with the add-on installed.
-
-> The add-on is only *tested* against Zotero 8.0.1, but its version range is
-> open-ended, so it installs on Zotero 9; `nomada status` confirms it loads. It
-> registers unauthenticated write endpoints on localhost, which is fine on a
-> personal machine but worth knowing.
-
-**`webapi` (needs a Zotero account)**
-Uses the official Zotero Web API. Needs sync **on**, your numeric Zotero user
-ID, and an API key with library write access
-(https://www.zotero.org/settings/keys). Uploaded PDFs use zotero.org storage
-quota.
+| command         | what it does |
+|-----------------|--------------|
+| `nomada config` | ask for settings and save them |
+| `nomada push`   | send papers tagged `new` to INBOX |
+| `nomada pull`   | attach annotated PDFs from EXPORT to their items |
+| `nomada sync`   | `pull`, then `push` |
+| `nomada status` | show folders, papers in flight, tag counts, and whether Zotero and the add-on respond |
 
 ## Setup
 
-1. **Install uv** and make `nomada` available on your `PATH`:
+1. Install [uv](https://docs.astral.sh/uv/) and put `nomada` on your `PATH`:
    ```sh
    curl -LsSf https://astral.sh/uv/install.sh | sh
    ln -s ~/zotero-nomad/nomada ~/.local/bin/nomada
    ```
-   `nomada` is a single file that declares its own dependencies, so `uv`
-   builds (and caches) its environment on the first run. Python ≥ 3.11 is
-   required; uv will fetch one if needed.
+   `nomada` is a single script that declares its own dependencies. uv builds
+   and caches its environment on the first run, and fetches Python 3.11 or
+   newer if needed.
 
-2. **Enable the Zotero local API** (needed by `push` and `status`):
-   Settings → Advanced → *Allow other applications on this computer to
-   communicate with Zotero.*
+2. In Zotero, enable the local API under Settings → Advanced → *Allow other
+   applications on this computer to communicate with Zotero*.
 
-3. **Install the Local Write API add-on**: download the latest `.xpi` from
-   github.com/dzackgarza/zotero-local-write-api/releases, then in Zotero:
-   Tools → Plugins → gear icon → *Install Plugin From File…*. Restart Zotero.
+3. Install the [Local Write API](https://github.com/dzackgarza/zotero-local-write-api)
+   add-on. Download the latest `.xpi` from its releases page, open Tools →
+   Plugins → gear icon → *Install Plugin From File…*, and restart Zotero.
 
-4. **Configure**:
+4. Configure and check:
    ```sh
    nomada config
    nomada status
    ```
    `status` exits with an error and marks the problem if a folder is missing
-   or Zotero or the add-on can't be reached.
+   or Zotero or the add-on doesn't respond.
+
+## Attaching PDFs
+
+`pull` can attach files in two ways. Tagging always goes through the Local
+Write API add-on, whichever you choose.
+
+**`localwrite`** is the default. The add-on sends the PDF to Zotero's local
+server, so no account or credentials are needed and nothing leaves your
+machine. Zotero must be running. The add-on is tested only against Zotero
+8.0.1, but it installs on Zotero 9, and `nomada status` confirms it loaded.
+Its write endpoints on localhost have no authentication, so any program on
+your computer can use them.
+
+**`webapi`** uses the Zotero Web API. It needs sync turned on, your numeric
+user ID, and an [API key](https://www.zotero.org/settings/keys) with library
+write access. Uploads count against your zotero.org storage quota. It can
+attach while Zotero is closed, as long as the item has synced, but tagging
+still needs the app.
 
 ## Files
 
-| what   | where |
-|--------|-------|
-| config | `$XDG_CONFIG_HOME/nomada/config.toml` (default `~/.config/nomada/`) |
-| state  | `$XDG_STATE_HOME/nomada/state.json` (default `~/.local/state/nomada/`) |
+| file   | location |
+|--------|----------|
+| config | `$XDG_CONFIG_HOME/nomada/config.toml`, default `~/.config/nomada/` |
+| state  | `$XDG_STATE_HOME/nomada/state.json`, default `~/.local/state/nomada/` |
 | log    | `$XDG_STATE_HOME/nomada/nomada.log` |
 
-The config file is written with owner-only permissions because it can hold an
-API key.
+Only your user can read the config file, because it can hold an API key.
 
-## Things to know
+## Behavior
 
-- **Errors are reported, not skipped silently.** `push` and `pull` report each
-  paper they can't handle (no stored PDF, failed attach or tag), carry on with
-  the others, and exit with status 1. If Zotero, INBOX, or EXPORT is
-  unavailable, they stop immediately with status 1.
-- **`pull` only handles papers that `push` sent.** Other PDFs in EXPORT, such
-  as exported notebooks, are left alone; `nomada status` lists them.
-- **Zotero must be running** for `push`, for tagging, and for the `localwrite`
-  backend. The `webapi` backend can attach while the desktop app is closed, as
-  long as the item has synced, but tagging still needs the app.
-- **Filenames must be unique** across papers, because `pull` matches by
-  filename. `push` refuses to send a paper whose filename matches another
-  in-flight paper. Letting Zotero's native citekey drive a rename pattern
-  guarantees uniqueness.
-- **Deletion is soft.** `pull` moves the INBOX original to `INBOX/_archived` and
-  the handled export to `EXPORT/_processed`, adding a timestamp to the name if
-  an earlier copy is already there.
-- **Exports need a minute to settle.** `pull` skips a PDF modified less than 60
-  seconds ago, since the sync client may still be writing it, and reports a
-  PDF without an end-of-file marker as possibly truncated.
-- **One run at a time.** `push`, `pull`, and `sync` lock the state file; a
-  second run started meanwhile exits with status 1.
+- `push` and `pull` report each paper they can't handle, continue with the
+  rest, and exit with status 1. If Zotero, INBOX, or EXPORT is unavailable,
+  they stop at once with status 1.
+- `pull` handles only papers that `push` sent. It leaves other PDFs in EXPORT,
+  such as exported notebooks, in place, and `nomada status` lists them.
+- Filenames must be unique among papers in flight, because `pull` matches by
+  filename. `push` refuses a paper whose filename is already in flight. A
+  Zotero rename pattern based on the citekey avoids collisions.
+- Nothing is deleted. `pull` moves the INBOX original to `INBOX/_archived` and
+  the export to `EXPORT/_processed`. If a file with the same name is already
+  there, it adds a timestamp to the name.
+- `pull` skips a PDF modified in the last 60 seconds, since the sync client
+  may still be writing it. It reports a PDF without an end-of-file marker as
+  possibly truncated.
+- `push`, `pull`, and `sync` lock the state file. A second run started while
+  one is going exits with status 1.
 
 ## Development
 
-Dependencies are pinned in `nomada.lock`; after editing the script's
-dependency block, run `uv lock --script nomada`. Run the tests with:
+`nomada.lock` pins the dependencies. After editing the script's dependency
+block, run `uv lock --script nomada`. To run the tests:
 
 ```sh
 uv run --no-project --with pytest --with click --with pyzotero --with requests --with tomli-w pytest tests/
