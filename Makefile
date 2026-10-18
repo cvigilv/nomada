@@ -19,4 +19,4 @@ uninstall:
 	rm -f "$(BINDIR)/nomada"
 
 test:
-	uv run --no-project --with pytest --with click --with pyzotero --with requests --with tomli-w pytest tests/
+	uv run --no-project --with pytest --with click --with pyzotero --with requests --with tomli-w --with pymupdf --with numpy pytest tests/

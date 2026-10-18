@@ -3,6 +3,8 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "click>=8.1",
+#     "numpy>=1.24",
+#     "pymupdf>=1.24",
 #     "pyzotero>=1.5",
 #     "requests>=2.28",
 #     "tomli-w>=1.0",
@@ -18,7 +20,10 @@
 filename -> item key, and moves the item's tag to `tag_inreview`. `pull`
 attaches each PDF found in EXPORT to the item recorded under the same filename,
 moves the tag to `tag_reviewed`, archives the INBOX original into
-INBOX/_archived, and moves the export into EXPORT/_processed.
+INBOX/_archived, and moves the export into EXPORT/_processed. `note` writes a
+Markdown literature note for each item tagged `tag_reviewed`, with the
+highlighted text and an image of each group of handwritten marks; `pull` does
+the same for each paper it imports when `note_on_pull` is set.
 
 Reading uses Zotero's local API. Tagging, and attaching with the "localwrite"
 backend, use the Local Write API add-on
@@ -33,6 +38,7 @@ import dataclasses
 import fcntl
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -87,6 +93,10 @@ class Config:
     tag_new: str = "new"
     tag_inreview: str = "inreview"
     tag_reviewed: str = "reviewed"
+    notes: str = ""  # folder for literature notes; empty disables them
+    note_images: str = ""  # folder for note images; empty means `notes`
+    note_template: str = ""  # Markdown template file; empty means NOTE_TEMPLATE
+    note_on_pull: bool = False
 
     @property
     def inbox_dir(self) -> Path:
@@ -109,11 +119,22 @@ class Config:
         return Path(self.zotero_storage).expanduser()
 
     @property
+    def notes_dir(self) -> Path:
+        return Path(self.notes).expanduser()
+
+    @property
+    def images_dir(self) -> Path:
+        return Path(self.note_images or self.notes).expanduser()
+
+    @property
     def pipeline_tags(self) -> tuple[str, str, str]:
         return (self.tag_new, self.tag_inreview, self.tag_reviewed)
 
 
 FIELDS = {f.name: f for f in dataclasses.fields(Config)}
+# Fields without a default are strings.
+FIELD_TYPES = {name: str if f.default is dataclasses.MISSING else type(f.default) for name, f in FIELDS.items()}
+TYPE_NAMES = {str: "a string", bool: "true or false"}
 
 
 def validate(cfg: Config) -> list[str]:
@@ -127,6 +148,8 @@ def validate(cfg: Config) -> list[str]:
         problems.append("tag_new, tag_inreview, and tag_reviewed must be non-empty and distinct")
     if not cfg.inbox or not cfg.export:
         problems.append("inbox and export must be set")
+    if cfg.note_on_pull and not cfg.notes:
+        problems.append("note_on_pull needs notes to be set")
     return problems
 
 
@@ -142,7 +165,11 @@ def load_config() -> Config:
         raise click.ClickException(f"no configuration found at {CONFIG_FILE}; run `nomada config`")
     raw = read_config_file()
     problems = [f"unknown key {k!r}" for k in raw if k not in FIELDS]
-    problems += [f"{k} must be a string" for k, v in raw.items() if k in FIELDS and not isinstance(v, str)]
+    problems += [
+        f"{k} must be {TYPE_NAMES[FIELD_TYPES[k]]}"
+        for k, v in raw.items()
+        if k in FIELDS and not isinstance(v, FIELD_TYPES[k])
+    ]
     problems += [
         f"missing required key {name!r}"
         for name, f in FIELDS.items()
@@ -179,6 +206,19 @@ def _existing_dir(value: str) -> str:
     path = Path(value).expanduser().resolve()
     if not path.is_dir():
         raise click.UsageError(f"{path} is not an existing directory")
+    return str(path)
+
+
+def _optional_dir(value: str) -> str:
+    return _existing_dir(value) if value else ""
+
+
+def _optional_file(value: str) -> str:
+    if not value:
+        return ""
+    path = Path(value).expanduser().resolve()
+    if not path.is_file():
+        raise click.UsageError(f"{path} is not an existing file")
     return str(path)
 
 
@@ -321,6 +361,307 @@ def attach(cfg: Config, parent_key: str, pdf: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Literature notes (see #1)
+# ---------------------------------------------------------------------------
+
+NOTE_TEMPLATE = """\
+---
+title:      "{{title}}"
+date:       {{date}}
+tags:       []
+identifier: "{{identifier}}"
+citekey:    "{{citekey}}"
+zotero:     "{{zotero_link}}"
+---
+
+# {{title}}
+
+{{authors}} ({{year}})
+
+## Highlights
+
+{{highlights}}
+
+## Handwritten notes
+
+{{handwriting}}
+"""
+
+PLACEHOLDER = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+PLACEHOLDERS = (
+    "title", "authors", "first_author", "year", "date", "identifier", "citekey",
+    "doi", "url", "zotero_key", "zotero_link", "today", "highlights", "handwriting",
+)
+SUPERNOTE_INK = "Supernote_Bitmap"  # /Name of the stamp that holds the Nomad's handwriting
+INK_GAP_PT = 36  # marks closer than this go into the same image
+INK_PAD_PT = 24  # printed context kept around each group of marks
+IMAGE_DPI = 150
+
+
+class NoteError(Exception):
+    pass
+
+
+def load_template(cfg: Config) -> str:
+    if not cfg.note_template:
+        return NOTE_TEMPLATE
+    path = Path(cfg.note_template).expanduser()
+    try:
+        template = path.read_text()
+    except OSError as e:
+        raise click.ClickException(f"can't read note template {path}: {e}")
+    unknown = sorted(set(PLACEHOLDER.findall(template)) - set(PLACEHOLDERS))
+    if unknown:
+        raise click.ClickException(
+            f"note template {path} uses unknown placeholder(s) {', '.join(unknown)}; "
+            f"known ones are {', '.join(PLACEHOLDERS)}"
+        )
+    return template
+
+
+def render_template(template: str, fields: dict[str, str]) -> str:
+    return PLACEHOLDER.sub(lambda m: fields[m.group(1)], template)
+
+
+def slugify(text: str) -> str:
+    """Lowercase `text` and join its runs of letters and digits with hyphens, as Denote does."""
+    return "-".join(re.findall(r"[^\W_]+", text.lower()))
+
+
+def paper_fields(item: dict) -> dict[str, str]:
+    """Metadata placeholders for the Zotero item `item`, as returned by the API."""
+    key, data = item["key"], item["data"]
+    title = (data.get("title") or "").strip()
+    if not title:
+        raise NoteError(f"item {key} has no title")
+    parsed = (item.get("meta") or {}).get("parsedDate") or ""
+    m = re.fullmatch(r"(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?", parsed)
+    if not m:
+        raise NoteError(f"item {key} has no parseable date ({data.get('date')!r}); set its Date field in Zotero")
+    year = m.group(1)
+    month, day = (g if g and g != "00" else "01" for g in m.group(2, 3))
+
+    names = [
+        c.get("lastName") or c.get("name") or ""
+        for c in data.get("creators", [])
+        if c.get("creatorType") == "author"
+    ]
+    names = [n for n in names if n]
+    if not names:
+        raise NoteError(f"item {key} has no authors")
+    citekey = data.get("citationKey") or ""
+    if not citekey:
+        found = re.search(r"^Citation Key:\s*(\S+)", data.get("extra") or "", re.MULTILINE)
+        citekey = found.group(1) if found else ""
+    return {
+        "title": title,
+        "authors": ", ".join(names),
+        "first_author": names[0],
+        "year": year,
+        "date": f"{year}-{month}-{day}",
+        "citekey": citekey,
+        "doi": data.get("DOI") or "",
+        "url": data.get("url") or "",
+        "zotero_key": key,
+        "zotero_link": f"zotero://select/library/items/{key}",
+        "today": datetime.now().strftime("%Y-%m-%d"),
+    }
+
+
+def note_slug(fields: dict[str, str]) -> str:
+    return slugify(f"{fields['first_author']} {fields['year']} {fields['title']}")
+
+
+def find_note(notes_dir: Path, slug: str) -> Path | None:
+    """The note for `slug`, with or without the keywords Denote appends after `__`."""
+    found = sorted({*notes_dir.glob(f"*==refs--{slug}.md"), *notes_dir.glob(f"*==refs--{slug}__*.md")})
+    if len(found) > 1:
+        raise NoteError(f"several notes match '{slug}': {', '.join(p.name for p in found)}")
+    return found[0] if found else None
+
+
+def new_identifier(notes_dir: Path, date: str) -> str:
+    """A Denote identifier on `date` at 09:00:SS, with SS the first second no note uses."""
+    stem = date.replace("-", "")
+    for second in range(60):
+        identifier = f"{stem}T0900{second:02d}"
+        if not any(notes_dir.glob(f"{identifier}*")):
+            return identifier
+    raise NoteError(f"all identifiers {stem}T090000 to {stem}T090059 are taken in {notes_dir}")
+
+
+def highlighted_text(page, annot) -> str:
+    """The words whose centers lie inside the quads of the highlight `annot`."""
+    import pymupdf
+
+    v = annot.vertices or []
+    quads = [pymupdf.Quad(v[i:i + 4]).rect for i in range(0, len(v) - 3, 4)]
+    words = [
+        w[4] for w in page.get_text("words")
+        if any(q.contains(((w[0] + w[2]) / 2, (w[1] + w[3]) / 2)) for q in quads)
+    ]
+    text = ""
+    for w in words:
+        # A word broken across lines ends in a hyphen; rejoin it unless the
+        # next part starts with a capital, as in "SMILES-PE".
+        if text.endswith("-") and w[:1].islower():
+            text = text[:-1] + w
+        elif text.endswith("-"):
+            text += w
+        else:
+            text += (" " if text else "") + w
+    return text
+
+
+def ink_boxes(mask, gap: int) -> list[tuple[int, int, int, int]]:
+    """Boxes (x0, y0, x1, y1), inclusive, around groups of True pixels in the 2-D `mask`.
+
+    Rows with ink are split into bands at gaps of more than `gap` empty rows,
+    each band into columns the same way, and each column again into rows.
+    """
+    def runs(flags):
+        idx = flags.nonzero()[0]
+        if not len(idx):
+            return []
+        breaks = (idx[1:] - idx[:-1] > gap).nonzero()[0]
+        starts = [idx[0], *idx[breaks + 1]]
+        ends = [*idx[breaks], idx[-1]]
+        return list(zip(starts, ends))
+
+    boxes = []
+    for r0, r1 in runs(mask.any(axis=1)):
+        band = mask[r0:r1 + 1]
+        for c0, c1 in runs(band.any(axis=0)):
+            for s0, s1 in runs(band[:, c0:c1 + 1].any(axis=1)):
+                boxes.append((int(c0), int(r0 + s0), int(c1), int(r0 + s1)))
+    return boxes
+
+
+def handwriting_images(path: Path) -> list[tuple[int, bytes]]:
+    """PNG crops (page number, bytes) of each group of handwritten marks in the export `path`.
+
+    The Nomad stores a page's handwriting as one full-page stamp. The marks are
+    the pixels that change when the stamp is drawn, and each crop shows them
+    over the printed page, highlights included.
+    """
+    import numpy as np
+    import pymupdf
+
+    def pixels(page, annots):
+        pix = page.get_pixmap(dpi=72, annots=annots)  # 1 pixel per point
+        return np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n).astype(np.int16)
+
+    images = []
+    # `ink_only` loses its other annotations, in memory only.
+    with pymupdf.open(path) as shown, pymupdf.open(path) as ink_only:
+        for page in ink_only:
+            annots = list(page.annots())
+            if not any(a.type[1] == "Stamp" and a.info["name"] == SUPERNOTE_INK for a in annots):
+                continue
+            if page.rotation:
+                raise NoteError(f"page {page.number + 1} is rotated, which handwriting extraction does not support")
+            for xref in [a.xref for a in annots if a.info["name"] != SUPERNOTE_INK]:
+                page.delete_annot(page.load_annot(xref))
+            mask = abs(pixels(page, True) - pixels(page, False)).max(axis=2) > 32
+            for x0, y0, x1, y1 in ink_boxes(mask, INK_GAP_PT):
+                clip = pymupdf.Rect(x0 - INK_PAD_PT, y0 - INK_PAD_PT, x1 + 1 + INK_PAD_PT, y1 + 1 + INK_PAD_PT) & page.rect
+                pix = shown[page.number].get_pixmap(dpi=IMAGE_DPI, clip=clip)
+                images.append((page.number + 1, pix.tobytes("png")))
+    return images
+
+
+def read_annotations(job: str, path: Path) -> tuple[list[tuple[int, str]], list[tuple[int, bytes]]]:
+    """Highlights (page, text) and handwriting crops (page, PNG) of the export `path`."""
+    import pymupdf
+
+    highlights = []
+    ignored: dict[str, int] = {}
+    with pymupdf.open(path) as doc:
+        for page in doc:
+            for annot in page.annots():
+                kind = annot.type[1]
+                if kind == "Highlight":
+                    highlights.append((page.number + 1, highlighted_text(page, annot)))
+                elif not (kind == "Stamp" and annot.info["name"] == SUPERNOTE_INK) and kind != "Popup":
+                    ignored[kind] = ignored.get(kind, 0) + 1
+    if ignored:
+        kinds = ", ".join(f"{n} {k}" for k, n in sorted(ignored.items()))
+        log(job, f"'{path.name}': left out annotations of unsupported types ({kinds})")
+    return highlights, handwriting_images(path)
+
+
+def write_note(cfg: Config, template: str, job: str, item: dict, pdf: Path, force: bool) -> Path | None:
+    """Write the literature note for `item` from its annotated PDF `pdf`.
+
+    Return the note's path, or None if the item already has a note and
+    `force` is false. With `force`, the existing note and its images are
+    replaced, and the note keeps its filename.
+    """
+    fields = paper_fields(item)
+    existing = find_note(cfg.notes_dir, note_slug(fields))
+    if existing and not force:
+        return None
+    if existing:
+        path = existing
+        identifier = existing.name.split("==", 1)[0]
+    else:
+        identifier = new_identifier(cfg.notes_dir, fields["date"])
+        path = cfg.notes_dir / f"{identifier}==refs--{note_slug(fields)}.md"
+
+    highlights, crops = read_annotations(job, pdf)
+    cfg.images_dir.mkdir(parents=True, exist_ok=True)
+    for old in cfg.images_dir.glob(f"{identifier}--p*.png"):
+        old.unlink()
+    embeds = []
+    for i, (page, png) in enumerate(crops, start=1):
+        name = f"{identifier}--p{page}-{i}.png"
+        (cfg.images_dir / name).write_bytes(png)
+        embeds.append(f"![[{name}]]")
+    fields |= {
+        "identifier": identifier,
+        "highlights": "\n\n".join(f"> {text} (p. {page})" for page, text in highlights),
+        "handwriting": "\n\n".join(embeds),
+    }
+    _atomic_write(path, render_template(template, fields))
+    return path
+
+
+def fetch_item(zot, key: str) -> dict:
+    try:
+        return zot.item(key)
+    except Exception as e:
+        raise NoteError(f"can't read item {key} from Zotero's local API: {e}") from e
+
+
+def notes_ready(cfg: Config, job: str) -> str:
+    """Check that notes can be written and return the template."""
+    if not cfg.notes:
+        fail(job, "no notes folder is configured; set `notes` with `nomada config`")
+    if not cfg.notes_dir.is_dir():
+        fail(job, f"notes folder not found: {cfg.notes_dir}")
+    return load_template(cfg)
+
+
+def annotated_pdf(cfg: Config, zot, key: str) -> Path:
+    """The stored file of the most recently added annotated attachment of item `key`."""
+    try:
+        children = zot.children(key)
+    except Exception as e:
+        raise NoteError(f"can't list attachments of item {key}: {e}") from e
+    copies = [
+        ch for ch in children
+        if ch["data"].get("contentType") == "application/pdf" and is_annotated(cfg, ch["data"])
+    ]
+    if not copies:
+        raise NoteError(f"item {key} has no annotated PDF")
+    latest = max(copies, key=lambda ch: ch["data"].get("dateAdded", ""))
+    path = cfg.storage_dir / latest["key"] / (latest["data"].get("filename") or "")
+    if not path.is_file():
+        raise NoteError(f"the annotated PDF of item {key} is not in {cfg.storage_dir} (has Zotero synced it?)")
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Jobs. Each returns the number of papers that hit a problem; problems that
 # prevent the whole job from running raise click.ClickException instead.
 # ---------------------------------------------------------------------------
@@ -401,6 +742,7 @@ def run_pull(cfg: Config) -> int:
         fail(job, f"EXPORT folder not found: {cfg.export_dir} (is the synced drive available?)")
     if not cfg.inbox_dir.is_dir():
         fail(job, f"INBOX folder not found: {cfg.inbox_dir} (is the synced drive available?)")
+    template = notes_ready(cfg, job) if cfg.note_on_pull else None
     cfg.processed_dir.mkdir(exist_ok=True)
     cfg.archive_dir.mkdir(exist_ok=True)
 
@@ -444,13 +786,55 @@ def run_pull(cfg: Config) -> int:
         inbox_file = cfg.inbox_dir / name
         if inbox_file.exists():
             move_unique(inbox_file, cfg.archive_dir)
-        move_unique(pdf, cfg.processed_dir)
+        processed = move_unique(pdf, cfg.processed_dir)
         del fmap[name]
         save_state(state)
+
+        if template is not None:
+            try:
+                note = write_note(cfg, template, job, fetch_item(local_zotero(), key), processed, force=False)
+            except (NoteError, OSError) as e:
+                log(job, f"can't write the note for item {key} (retry with `nomada note {key}`): {e}", error=True)
+                failures += 1
+                continue
+            if note:
+                log(job, f"-> note  {note.name}")
+            else:
+                log(job, f"item {key} already has a note; left it unchanged")
 
     if unmatched:
         log(job, f"skipped {unmatched} PDF(s) in EXPORT that match no pushed paper; see `nomada status`", persist=False)
     log(job, f"imported {imported} annotated paper(s) into Zotero", persist=imported > 0)
+    return failures
+
+
+def run_note(cfg: Config, keys: tuple[str, ...], force: bool) -> int:
+    job = "note"
+    template = notes_ready(cfg, job)
+    zot = local_zotero()
+    if not keys:
+        try:
+            keys = tuple(item["key"] for item in zot.everything(zot.top(tag=cfg.tag_reviewed)))
+        except Exception as e:
+            fail(job, f"can't query Zotero's local API (is Zotero running, with local API access enabled?): {e}")
+
+    failures = written = skipped = 0
+    for key in keys:
+        try:
+            item = fetch_item(zot, key)
+            note = write_note(cfg, template, job, item, annotated_pdf(cfg, zot, key), force)
+        except (NoteError, OSError) as e:
+            log(job, f"can't write the note for item {key}: {e}", error=True)
+            failures += 1
+            continue
+        if note:
+            log(job, f"-> note  {note.name}  (item {key})")
+            written += 1
+        else:
+            skipped += 1
+    if skipped:
+        log(job, f"skipped {skipped} item(s) that already have a note; use --force to replace them", persist=False)
+    log(job, f"wrote {written} note(s)", persist=written > 0)
     return failures
 
 
@@ -490,7 +874,8 @@ def cli() -> None:
 
     Tag a paper in Zotero with your "new" tag and run `nomada push` to send its
     PDF to the SuperNote INBOX folder. After exporting the annotated PDF on the
-    Nomad, run `nomada pull` to attach it to the original Zotero item.
+    Nomad, run `nomada pull` to attach it to the original Zotero item, and
+    `nomada note` to write a literature note from its annotations.
 
     \b
     Examples:
@@ -512,10 +897,10 @@ def config() -> None:
     current = {}
     if CONFIG_FILE.exists():
         raw = read_config_file()
-        current = {k: v for k, v in raw.items() if k in FIELDS and isinstance(v, str)}
+        current = {k: v for k, v in raw.items() if k in FIELDS and isinstance(v, FIELD_TYPES[k])}
         dropped = sorted(set(raw) - set(current))
         if dropped:
-            click.echo(f"warning: dropping unknown or non-string keys: {', '.join(dropped)}", err=True)
+            click.echo(f"warning: dropping unknown or mistyped keys: {', '.join(dropped)}", err=True)
         click.echo(f"Updating {CONFIG_FILE}", err=True)
     else:
         click.echo(f"Creating {CONFIG_FILE}", err=True)
@@ -543,6 +928,18 @@ def config() -> None:
     values["tag_new"] = ask("tag_new", "Tag that queues a paper for the Nomad")
     values["tag_inreview"] = ask("tag_inreview", "Tag for papers on the Nomad")
     values["tag_reviewed"] = ask("tag_reviewed", "Tag for papers with an annotated copy")
+    values["notes"] = ask("notes", "Folder for literature notes (empty for none)", value_proc=_optional_dir)
+    if values["notes"]:
+        values["note_images"] = ask("note_images", "Folder for note images (empty for the notes folder)",
+                                    value_proc=_optional_dir)
+        values["note_template"] = ask("note_template", "Note template file (empty for the built-in one)",
+                                      value_proc=_optional_file)
+        values["note_on_pull"] = click.confirm("Write a note for each paper `pull` imports?",
+                                               default=current.get("note_on_pull", False))
+    else:
+        values["note_on_pull"] = False
+        for name in ("note_images", "note_template"):
+            values[name] = current.get(name, "")
 
     cfg = Config(**values)
     problems = validate(cfg)
@@ -567,6 +964,21 @@ def pull() -> None:
     cfg = load_config()
     with state_lock():
         finish(run_pull(cfg))
+
+
+@cli.command()
+@click.argument("item_keys", nargs=-1)
+@click.option("--force", is_flag=True, help="Replace existing notes and their images.")
+def note(item_keys: tuple[str, ...], force: bool) -> None:
+    """Write literature notes for papers tagged "reviewed".
+
+    A note holds the paper's highlighted passages and an image of each group
+    of handwritten marks, read from its annotated PDF in Zotero storage. With
+    ITEM_KEYS, only those Zotero items get notes. Papers that already have a
+    note are skipped unless --force is given.
+    """
+    cfg = load_config()
+    finish(run_note(cfg, item_keys, force))
 
 
 @cli.command()
@@ -612,6 +1024,11 @@ def status() -> None:
     if not cfg.storage_dir.is_dir():
         rows.append(("storage", f"{cfg.storage_dir}  (MISSING)"))
         ok = False
+    if cfg.notes:
+        missing = "" if cfg.notes_dir.is_dir() else "  (MISSING)"
+        on_pull = "written on pull" if cfg.note_on_pull else "written by `nomada note`"
+        rows.append(("notes", f"{cfg.notes_dir}{missing}  ({on_pull})"))
+        ok = ok and not missing
     fmap = load_state()["map"]
     rows.append(("in flight", f"{len(fmap)} paper(s) pushed and not yet pulled"))
     # Listed after the table; neither affects the exit status.

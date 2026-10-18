@@ -43,6 +43,7 @@ three tags, and their names are configurable.
 | `nomada config` | ask for settings and save them |
 | `nomada push`   | send papers tagged `new` to INBOX |
 | `nomada pull`   | attach annotated PDFs from EXPORT to their items |
+| `nomada note`   | write literature notes for papers tagged `reviewed` |
 | `nomada sync`   | `pull`, then `push` |
 | `nomada status` | show folders, papers in flight, tag counts, and whether Zotero and the add-on respond |
 
@@ -96,6 +97,48 @@ write access. Uploads count against your zotero.org storage quota. It can
 attach while Zotero is closed, as long as the item has synced, but tagging
 still needs the app.
 
+## Literature notes
+
+`nomada note` writes a Markdown note for each Zotero item tagged `reviewed`,
+reading the annotations from its annotated PDF in Zotero storage. With
+`webapi`, Zotero must have synced that PDF down first. `nomada note KEY...`
+limits it to the given item keys. If you answer yes to *Write a note for each
+paper `pull` imports?* in `nomada config` (`note_on_pull = true`), `pull` also
+writes a note right after it attaches each paper.
+
+A note contains:
+
+- each highlighted passage as a block quote with its page number;
+- an image of each group of handwritten marks, cropped from the page with the
+  printed text around it and embedded as `![[image.png]]`.
+
+Notes are named the Denote way,
+`20210301T090000==refs--kanerva-2021-title-of-the-paper.md`. The identifier is
+the publication date at 09:00:00; the seconds count up if another note
+already uses it. Images go in the `note_images` folder, or the notes folder if
+that is empty, named after the note's identifier.
+
+A paper whose note already exists is skipped, including after you add
+keywords to its name (`...__hdc.md`). `nomada note --force` rewrites the note
+in place and replaces its images, which discards your edits to it.
+
+The note's layout comes from a template. The built-in one has Denote-style
+front matter, a Highlights section, and a Handwritten notes section. To use
+your own, set `note_template` to a Markdown file that uses these placeholders:
+
+| placeholder | value |
+|-------------|-------|
+| `{{title}}`, `{{authors}}`, `{{first_author}}` | from Zotero; authors are last names, comma-separated |
+| `{{year}}`, `{{date}}` | publication year and date (`YYYY-MM-DD`, missing parts as `01`) |
+| `{{identifier}}` | the Denote identifier |
+| `{{citekey}}` | Zotero's citation key, or Better BibTeX's from the Extra field |
+| `{{doi}}`, `{{url}}`, `{{zotero_key}}`, `{{zotero_link}}` | links back to the paper |
+| `{{today}}` | the date the note was written |
+| `{{highlights}}`, `{{handwriting}}` | the annotations |
+
+An unknown placeholder is an error. A paper without a title, author, or date
+in Zotero gets no note, and other annotation types are reported and left out.
+
 ## Files
 
 | file   | location |
@@ -122,6 +165,8 @@ Only your user can read the config file, because it can hold an API key.
 - `pull` skips a PDF modified in the last 60 seconds, since the sync client
   may still be writing it. It reports a PDF without an end-of-file marker as
   possibly truncated.
+- A failed note doesn't undo the `pull` of its paper; `pull` reports it and
+  exits with status 1, and `nomada note KEY` retries it.
 - `push`, `pull`, and `sync` lock the state file. A second run started while
   one is going exits with status 1.
 
