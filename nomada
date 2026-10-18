@@ -323,17 +323,17 @@ def is_annotated(cfg: Config, data: dict) -> bool:
     )
 
 
-def _attach_localwrite(cfg: Config, parent_key: str, pdf: Path) -> str:
+def _attach_localwrite(cfg: Config, parent_key: str, pdf: Path) -> str | None:
     payload = {
         "item_key": parent_key,
         "title": cfg.annotated_title,
         "file_name": annotated_name(cfg, pdf),
         "file_bytes_base64": base64.b64encode(pdf.read_bytes()).decode("ascii"),
     }
-    return _local_post("/attach", payload, timeout=120).get("attachment_key", "ok")
+    return _local_post("/attach", payload, timeout=120).get("attachment_key")
 
 
-def _attach_webapi(cfg: Config, parent_key: str, pdf: Path) -> str:
+def _attach_webapi(cfg: Config, parent_key: str, pdf: Path) -> str | None:
     from pyzotero import zotero
 
     zot = zotero.Zotero(cfg.zotero_user_id, "user", cfg.zotero_api_key)
@@ -350,11 +350,13 @@ def _attach_webapi(cfg: Config, parent_key: str, pdf: Path) -> str:
             raise WriteError(f"upload to zotero.org failed: {e}") from e
     if isinstance(res, dict) and res.get("failure"):
         raise WriteError(f"upload to zotero.org failed: {res['failure']}")
-    return "ok"
+    # "unchanged" lists new attachments whose file was already on the server.
+    created = [*res.get("success", []), *res.get("unchanged", [])] if isinstance(res, dict) else []
+    return created[0].get("key") if len(created) == 1 else None
 
 
-def attach(cfg: Config, parent_key: str, pdf: Path) -> str:
-    """Attach `pdf` to the Zotero item `parent_key`; return the new attachment key or "ok"."""
+def attach(cfg: Config, parent_key: str, pdf: Path) -> str | None:
+    """Attach `pdf` to the Zotero item `parent_key`; return the new attachment key, if reported."""
     if cfg.write_backend == "localwrite":
         return _attach_localwrite(cfg, parent_key, pdf)
     return _attach_webapi(cfg, parent_key, pdf)
@@ -590,9 +592,13 @@ def read_annotations(job: str, path: Path) -> tuple[list[tuple[int, str]], list[
     return highlights, handwriting_images(path)
 
 
-def write_note(cfg: Config, template: str, job: str, item: dict, pdf: Path, force: bool) -> Path | None:
+def write_note(
+    cfg: Config, template: str, job: str, item: dict, pdf: Path, attachment_key: str | None, force: bool
+) -> Path | None:
     """Write the literature note for `item` from its annotated PDF `pdf`.
 
+    Each highlight links to its page in the Zotero attachment
+    `attachment_key`; with None, highlights give the page without a link.
     Return the note's path, or None if the item already has a note and
     `force` is false. With `force`, the existing note and its images are
     replaced, and the note keeps its filename.
@@ -617,9 +623,17 @@ def write_note(cfg: Config, template: str, job: str, item: dict, pdf: Path, forc
         name = f"{identifier}--p{page}-{i}.png"
         (cfg.images_dir / name).write_bytes(png)
         embeds.append(f"![[{name}]]")
+    if attachment_key is None and highlights:
+        log(job, f"no Zotero attachment key for '{pdf.name}'; highlights are not linked to Zotero")
+
+    def cite(page: int) -> str:
+        if attachment_key is None:
+            return f"p. {page}"
+        return f"[p. {page}](zotero://open-pdf/library/items/{attachment_key}?page={page})"
+
     fields |= {
         "identifier": identifier,
-        "highlights": "\n\n".join(f"> {text} (p. {page})" for page, text in highlights),
+        "highlights": "\n\n".join(f"> {text} ({cite(page)})" for page, text in highlights),
         "handwriting": "\n\n".join(embeds),
     }
     _atomic_write(path, render_template(template, fields))
@@ -642,8 +656,8 @@ def notes_ready(cfg: Config, job: str) -> str:
     return load_template(cfg)
 
 
-def annotated_pdf(cfg: Config, zot, key: str) -> Path:
-    """The stored file of the most recently added annotated attachment of item `key`."""
+def annotated_pdf(cfg: Config, zot, key: str) -> tuple[str, Path]:
+    """The key and stored file of the most recently added annotated attachment of item `key`."""
     try:
         children = zot.children(key)
     except Exception as e:
@@ -658,7 +672,7 @@ def annotated_pdf(cfg: Config, zot, key: str) -> Path:
     path = cfg.storage_dir / latest["key"] / (latest["data"].get("filename") or "")
     if not path.is_file():
         raise NoteError(f"the annotated PDF of item {key} is not in {cfg.storage_dir} (has Zotero synced it?)")
-    return path
+    return latest["key"], path
 
 
 # ---------------------------------------------------------------------------
@@ -767,12 +781,12 @@ def run_pull(cfg: Config) -> int:
             continue
 
         try:
-            result = attach(cfg, key, pdf)
+            att_key = attach(cfg, key, pdf)
         except WriteError as e:
             log(job, f"can't attach '{name}' to item {key}: {e}", error=True)
             failures += 1
             continue
-        log(job, f"<- EXPORT {name}  (item {key}, {cfg.write_backend}: {result})")
+        log(job, f"<- EXPORT {name}  (item {key}, {cfg.write_backend}: {att_key or 'no attachment key returned'})")
         imported += 1
 
         # The attachment exists now, so the files move on even if tagging
@@ -792,7 +806,7 @@ def run_pull(cfg: Config) -> int:
 
         if template is not None:
             try:
-                note = write_note(cfg, template, job, fetch_item(local_zotero(), key), processed, force=False)
+                note = write_note(cfg, template, job, fetch_item(local_zotero(), key), processed, att_key, force=False)
             except (NoteError, OSError) as e:
                 log(job, f"can't write the note for item {key} (retry with `nomada note {key}`): {e}", error=True)
                 failures += 1
@@ -822,7 +836,8 @@ def run_note(cfg: Config, keys: tuple[str, ...], force: bool) -> int:
     for key in keys:
         try:
             item = fetch_item(zot, key)
-            note = write_note(cfg, template, job, item, annotated_pdf(cfg, zot, key), force)
+            att_key, pdf = annotated_pdf(cfg, zot, key)
+            note = write_note(cfg, template, job, item, pdf, att_key, force)
         except (NoteError, OSError) as e:
             log(job, f"can't write the note for item {key}: {e}", error=True)
             failures += 1

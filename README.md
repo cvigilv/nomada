@@ -108,7 +108,8 @@ writes a note right after it attaches each paper.
 
 A note contains:
 
-- each highlighted passage as a block quote with its page number;
+- each highlighted passage as a block quote with its page number, linked to
+  that page of the annotated PDF in Zotero (`zotero://open-pdf/...?page=N`);
 - an image of each group of handwritten marks, cropped from the page with the
   printed text around it and embedded as `![[image.png]]`.
 

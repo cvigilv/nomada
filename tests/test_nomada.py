@@ -206,6 +206,24 @@ def test_push_fails_without_inbox(env):
         env.m.run_push(env.cfg)
 
 
+def test_webapi_attach_returns_attachment_key(env, monkeypatch):
+    class FakeWebZotero:
+        def __init__(self, *args):
+            pass
+
+        def item(self, key):
+            return {"key": key}
+
+        def attachment_simple(self, files, parent):
+            return {"success": [{"key": "WEBKEY", "filename": Path(files[0]).name}], "failure": [], "unchanged": []}
+
+    import pyzotero.zotero
+    monkeypatch.setattr(pyzotero.zotero, "Zotero", FakeWebZotero)
+    env.cfg.write_backend = "webapi"
+    write_settled(env.export / "a.pdf")
+    assert env.m.attach(env.cfg, "P1", env.export / "a.pdf") == "WEBKEY"
+
+
 def test_pull_ignores_unmatched_pdf(env):
     write_settled(env.export / "notebook.pdf")
     assert env.m.run_pull(env.cfg) == 0
@@ -292,7 +310,7 @@ def test_pull_writes_note(notes_env):
 
     assert m.run_pull(env.cfg) == 0
     text = (env.notes / NOTE_NAME).read_text()
-    assert "> vectors are robust (p. 1)" in text
+    assert "> vectors are robust ([p. 1](zotero://open-pdf/library/items/NEWKEY?page=1))" in text
     assert 'citekey:    "kanerva2021"' in text
     images = sorted(p.name for p in (env.notes / "attachments").iterdir())
     assert images == ["20210301T090000--p1-1.png", "20210301T090000--p1-2.png"]
@@ -313,7 +331,7 @@ def test_note_skips_existing_unless_forced(notes_env):
     assert not (env.notes / NOTE_NAME).exists()
 
     assert m.run_note(env.cfg, (), force=True) == 0
-    assert "> vectors are robust (p. 1)" in edited.read_text()
+    assert "> vectors are robust ([p. 1](zotero://open-pdf/library/items/A2?page=1))" in edited.read_text()
     assert not (env.notes / NOTE_NAME).exists()
 
 
