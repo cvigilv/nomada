@@ -1,5 +1,6 @@
 """Tests for nomada, run against a fake Zotero (local API and Local Write API)."""
 import fcntl
+import math
 import importlib.machinery
 import importlib.util
 import os
@@ -59,13 +60,16 @@ def record(key, title="Robust Vectors", date="2021-03", author="Kanerva"):
                      "extra": "Citation Key: kanerva2021"}}
 
 
+STAMPS = ((72, 300, 150, 340), (400, 600, 480, 640))  # points
+
+
 def annotated_export():
     """A PDF with one highlight and two distant handwriting stamps, as the Nomad exports it."""
     doc = pymupdf.open()
     page = doc.new_page()
     page.insert_text((72, 100), "Hyperdimensional vectors are robust to noise.", fontsize=11)
     page.add_highlight_annot(page.search_for("vectors are robust", quads=True))
-    for rect in ((72, 300, 150, 340), (400, 600, 480, 640)):
+    for rect in STAMPS:
         stamp = page.add_stamp_annot(pymupdf.Rect(rect))
         stamp.set_name("Supernote_Bitmap")
         stamp.update()
@@ -316,8 +320,39 @@ def test_pull_writes_note(notes_env):
     assert "signature:  refs\n" in text
     assert "\n# Kanerva, 2021 - Robust Vectors\n" in text
     images = sorted(p.name for p in (env.notes / "attachments").iterdir())
-    assert images == ["20210301T090000--p1-1.png", "20210301T090000--p1-2.png"]
+    assert images == ["20210301T090001==refs--kanerva-2021-robust-vectors-annotation-p1-1.png",
+                      "20210301T090002==refs--kanerva-2021-robust-vectors-annotation-p1-2.png"]
     assert all(f"![[{name}]]" in text for name in images)
+
+
+def test_handwriting_images_color_one_group_each(nomada, tmp_path):
+    pdf = tmp_path / "a.pdf"
+    pdf.write_bytes(annotated_export())
+    images = nomada.handwriting_images(pdf)
+    assert [page for page, _ in images] == [1, 1]
+    scale = nomada.IMAGE_DPI / 72
+    # Away from the handwriting, each image is the page without highlights, in gray.
+    plain = pymupdf.open(pdf)[0].get_pixmap(dpi=nomada.IMAGE_DPI, annots=False, alpha=False)
+    plain = np.frombuffer(plain.samples, np.uint8).reshape(plain.h, plain.w, 3)
+    expected = (plain @ np.array([0.299, 0.587, 0.114])).round()
+    away = np.ones(expected.shape, bool)
+    for x0, y0, x1, y1 in STAMPS:
+        away[math.floor(y0 * scale) - 2:math.ceil(y1 * scale) + 2, math.floor(x0 * scale) - 2:math.ceil(x1 * scale) + 2] = False
+    for (_, png), (x0, y0, x1, y1) in zip(images, STAMPS):
+        pix = pymupdf.Pixmap(png)
+        assert (pix.w, pix.h) == (math.ceil(595 * scale), math.ceil(842 * scale))  # the whole page
+        rgb = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n).astype(int)
+        ys, xs = np.nonzero(rgb.max(axis=2) - rgb.min(axis=2) > 0)
+        assert len(ys), "the group keeps its color"
+        assert x0 * scale - 2 <= xs.min() and xs.max() <= x1 * scale + 2
+        assert y0 * scale - 2 <= ys.min() and ys.max() <= y1 * scale + 2
+        assert (rgb[:, :, 0][away] == expected[away]).all()
+
+
+def test_annotation_name_keeps_keywords_last(nomada):
+    note = Path("20210301T090000==refs--kanerva-2021-robust-vectors__hdc_graph.md")
+    assert (nomada.annotation_name(note, "20210301T090003", 4, 2)
+            == "20210301T090003==refs--kanerva-2021-robust-vectors-annotation-p4-2__hdc_graph.png")
 
 
 def test_note_skips_existing_unless_forced(notes_env):
@@ -327,7 +362,11 @@ def test_note_skips_existing_unless_forced(notes_env):
     env.store("A2", "a (annotated).pdf", annotated_export())
     # A renamed note is still found by the Zotero link in its front matter.
     edited = env.notes / "20210301T090000--robust-vectors__hdc.md"
-    edited.write_text('---\nzotero: "zotero://select/library/items/P1"\n---\nmy edits\n')
+    old_image = "20210301T090005--robust-vectors-annotation-p3-1__hdc.png"
+    edited.write_text('---\nzotero: "zotero://select/library/items/P1"\n---\nmy edits\n'
+                      f"![[{old_image}]]\n")
+    (env.notes / "attachments").mkdir()
+    (env.notes / "attachments" / old_image).write_bytes(b"old")
     # A link to the paper outside the front matter does not make a note its note.
     (env.notes / "20240101T090000--other.md").write_text("see zotero://select/library/items/P1\n")
 
@@ -338,6 +377,11 @@ def test_note_skips_existing_unless_forced(notes_env):
     assert m.run_note(env.cfg, (), force=True) == 0
     assert "> vectors are robust ([p. 1](zotero://open-pdf/library/items/A2?page=1))" in edited.read_text()
     assert not (env.notes / NOTE_NAME).exists()
+    # The old image is replaced, and the new ones are named after the renamed note.
+    assert sorted(p.name for p in (env.notes / "attachments").iterdir()) == [
+        "20210301T090001--robust-vectors-annotation-p1-1__hdc.png",
+        "20210301T090002--robust-vectors-annotation-p1-2__hdc.png",
+    ]
 
 
 def test_note_reports_missing_annotated_pdf(notes_env):
@@ -346,14 +390,24 @@ def test_note_reports_missing_annotated_pdf(notes_env):
     assert list(notes_env.notes.iterdir()) == []
 
 
-def test_note_identifier_skips_taken_seconds(notes_env):
+def test_note_identifiers_skip_taken_seconds(notes_env):
     env, m = notes_env, notes_env.m
     (env.notes / "20210301T090000==refs--other-2021-paper.md").write_text("")
+    (env.notes / "attachments").mkdir()
+    (env.notes / "attachments" / "20210301T090002==refs--other-2021-paper-annotation-p1-1.png").write_bytes(b"")
     child = pdf_child("A2", "a (annotated).pdf", title=env.cfg.annotated_title)
     env.set_items({"P1": [child]}, records={"P1": record("P1")})
     env.store("A2", "a (annotated).pdf", annotated_export())
     assert m.run_note(env.cfg, ("P1",), force=False) == 0
     assert (env.notes / NOTE_NAME.replace("T090000", "T090001")).exists()
+    names = sorted(p.name for p in (env.notes / "attachments").iterdir())
+    assert names[1:] == ["20210301T090003==refs--kanerva-2021-robust-vectors-annotation-p1-1.png",
+                         "20210301T090004==refs--kanerva-2021-robust-vectors-annotation-p1-2.png"]
+
+
+def test_free_identifiers_carry_into_minutes(nomada):
+    start = nomada.datetime(2021, 3, 1, 9, 0, 58)
+    assert nomada.free_identifiers(start, 2, {"20210301T090059"}) == ["20210301T090058", "20210301T090100"]
 
 
 def test_note_template_keeps_literal_text(notes_env, tmp_path):

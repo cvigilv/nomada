@@ -45,7 +45,7 @@ import tempfile
 import time
 import tomllib
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator, NoReturn
 
@@ -399,8 +399,11 @@ PLACEHOLDERS = (
 )
 SUPERNOTE_INK = "Supernote_Bitmap"  # /Name of the stamp that holds the Nomad's handwriting
 INK_GAP_PT = 36  # marks closer than this go into the same image
-INK_PAD_PT = 24  # printed context kept around each group of marks
 IMAGE_DPI = 150
+DENOTE_ID = re.compile(r"\d{8}T\d{6}")
+# Embeds of the images `write_note` makes, e.g.
+# ![[20210301T090001==refs--kanerva-2021-robust-vectors-annotation-p1-1.png]]
+ANNOTATION_EMBED = re.compile(r"!\[\[(\d{8}T\d{6}[^\]|/]*-annotation-p\d+-\d+(?:__[^\]|/]*)?\.png)(?:\|[^\]]*)?\]\]")
 
 
 class NoteError(Exception):
@@ -496,14 +499,29 @@ def find_note(notes_dir: Path, key: str) -> Path | None:
     return found[0] if found else None
 
 
-def new_identifier(notes_dir: Path, date: str) -> str:
-    """A Denote identifier on `date` at 09:00:SS, with SS the first second no note uses."""
-    stem = date.replace("-", "")
-    for second in range(60):
-        identifier = f"{stem}T0900{second:02d}"
-        if not any(notes_dir.glob(f"{identifier}*")):
-            return identifier
-    raise NoteError(f"all identifiers {stem}T090000 to {stem}T090059 are taken in {notes_dir}")
+def taken_identifiers(*dirs: Path) -> set[str]:
+    """The Denote identifiers that start the names of files in `dirs`."""
+    return {m.group() for d in dirs if d.is_dir() for f in d.iterdir() if (m := DENOTE_ID.match(f.name))}
+
+
+def free_identifiers(start: datetime, count: int, taken: set[str]) -> list[str]:
+    """The first `count` identifiers from `start` on, one second apart, that are not in `taken`."""
+    found = []
+    while len(found) < count:
+        identifier = start.strftime("%Y%m%dT%H%M%S")
+        if identifier not in taken:
+            found.append(identifier)
+        start += timedelta(seconds=1)
+    return found
+
+
+def annotation_name(note: Path, identifier: str, page: int, n: int) -> str:
+    """The name of image `n` of page `page` of `note`: the note's name with
+    `identifier` in place of its own and `-annotation-p<page>-<n>` ending the
+    title, before any `__keywords`."""
+    rest = DENOTE_ID.sub("", note.stem, count=1)
+    title, sep, keywords = rest.partition("__")
+    return f"{identifier}{title}-annotation-p{page}-{n}{sep}{keywords}.png"
 
 
 def highlighted_text(page, annot) -> str:
@@ -554,23 +572,24 @@ def ink_boxes(mask, gap: int) -> list[tuple[int, int, int, int]]:
 
 
 def handwriting_images(path: Path) -> list[tuple[int, bytes]]:
-    """PNG crops (page number, bytes) of each group of handwritten marks in the export `path`.
+    """PNG images (page number, bytes), one per group of handwritten marks in the export `path`.
 
     The Nomad stores a page's handwriting as one full-page stamp. The marks are
-    the pixels that change when the stamp is drawn, and each crop shows them
-    over the printed page, highlights included.
+    the pixels that change when the stamp is drawn. Each image shows the whole
+    page without its highlights, in grayscale except for one group of marks,
+    which keeps its color.
     """
     import numpy as np
     import pymupdf
 
     def pixels(page, annots):
-        pix = page.get_pixmap(dpi=72, annots=annots)  # 1 pixel per point
+        pix = page.get_pixmap(dpi=IMAGE_DPI, annots=annots, alpha=False)
         return np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n).astype(np.int16)
 
     images = []
-    # `ink_only` loses its other annotations, in memory only.
-    with pymupdf.open(path) as shown, pymupdf.open(path) as ink_only:
-        for page in ink_only:
+    # Pages lose their other annotations, in memory only.
+    with pymupdf.open(path) as doc:
+        for page in doc:
             annots = list(page.annots())
             if not any(a.type[1] == "Stamp" and a.info["name"] == SUPERNOTE_INK for a in annots):
                 continue
@@ -578,16 +597,22 @@ def handwriting_images(path: Path) -> list[tuple[int, bytes]]:
                 raise NoteError(f"page {page.number + 1} is rotated, which handwriting extraction does not support")
             for xref in [a.xref for a in annots if a.info["name"] != SUPERNOTE_INK]:
                 page.delete_annot(page.load_annot(xref))
-            mask = abs(pixels(page, True) - pixels(page, False)).max(axis=2) > 32
-            for x0, y0, x1, y1 in ink_boxes(mask, INK_GAP_PT):
-                clip = pymupdf.Rect(x0 - INK_PAD_PT, y0 - INK_PAD_PT, x1 + 1 + INK_PAD_PT, y1 + 1 + INK_PAD_PT) & page.rect
-                pix = shown[page.number].get_pixmap(dpi=IMAGE_DPI, clip=clip)
+            color = pixels(page, True)
+            mask = abs(color - pixels(page, False)).max(axis=2) > 32
+            gray = (color @ np.array([0.299, 0.587, 0.114])).round().astype(np.int16)  # ITU-R BT.601 luma
+            gray = np.repeat(gray[:, :, None], 3, axis=2)
+            # ink_boxes returns disjoint boxes, so each holds only its own group's marks.
+            for x0, y0, x1, y1 in ink_boxes(mask, round(INK_GAP_PT * IMAGE_DPI / 72)):
+                group = np.zeros_like(mask)
+                group[y0:y1 + 1, x0:x1 + 1] = mask[y0:y1 + 1, x0:x1 + 1]
+                out = np.where(group[:, :, None], color, gray).astype(np.uint8)
+                pix = pymupdf.Pixmap(pymupdf.csRGB, out.shape[1], out.shape[0], out.tobytes(), False)
                 images.append((page.number + 1, pix.tobytes("png")))
     return images
 
 
 def read_annotations(job: str, path: Path) -> tuple[list[tuple[int, str]], list[tuple[int, bytes]]]:
-    """Highlights (page, text) and handwriting crops (page, PNG) of the export `path`."""
+    """Highlights (page, text) and handwriting images (page, PNG) of the export `path`."""
     import pymupdf
 
     highlights = []
@@ -613,10 +638,13 @@ def write_note(
 
     Each highlight links to its page in the Zotero attachment
     `attachment_key`; with None, highlights give the page without a link.
+    Each handwriting image is named after the note, with its own identifier:
+    the next second after the note's that no other file uses.
+
     Return the note's path, or None if the item already has a note and
-    `force` is false. With `force`, the existing note and its images are
-    replaced, and the note keeps its filename. An existing note is
-    recognized by the Zotero link in its front matter.
+    `force` is false. With `force`, the existing note and the images it
+    embeds are replaced, and the note keeps its filename. An existing note
+    is recognized by the Zotero link in its front matter.
     """
     fields = paper_fields(item)
     existing = find_note(cfg.notes_dir, item["key"])
@@ -624,21 +652,27 @@ def write_note(
         return None
     if existing:
         path = existing
-        m = re.match(r"\d{8}T\d{6}", existing.name)
+        m = DENOTE_ID.match(existing.name)
         if not m:
             raise NoteError(f"note {existing.name} has no Denote identifier at the start of its name")
         identifier = m.group()
     else:
-        identifier = new_identifier(cfg.notes_dir, fields["date"])
+        start = datetime.strptime(f"{fields['date']} 09:00:00", "%Y-%m-%d %H:%M:%S")
+        (identifier,) = free_identifiers(start, 1, taken_identifiers(cfg.notes_dir, cfg.images_dir))
         path = cfg.notes_dir / f"{identifier}==refs--{note_slug(fields)}.md"
 
-    highlights, crops = read_annotations(job, pdf)
+    highlights, images = read_annotations(job, pdf)
     cfg.images_dir.mkdir(parents=True, exist_ok=True)
-    for old in cfg.images_dir.glob(f"{identifier}--p*.png"):
-        old.unlink()
+    if existing:
+        for old in ANNOTATION_EMBED.findall(existing.read_text()):
+            (cfg.images_dir / old).unlink(missing_ok=True)
+    taken = taken_identifiers(cfg.notes_dir, cfg.images_dir) | {identifier}
+    start = datetime.strptime(identifier, "%Y%m%dT%H%M%S") + timedelta(seconds=1)
     embeds = []
-    for i, (page, png) in enumerate(crops, start=1):
-        name = f"{identifier}--p{page}-{i}.png"
+    per_page: dict[int, int] = {}
+    for image_id, (page, png) in zip(free_identifiers(start, len(images), taken), images):
+        per_page[page] = per_page.get(page, 0) + 1
+        name = annotation_name(path, image_id, page, per_page[page])
         (cfg.images_dir / name).write_bytes(png)
         embeds.append(f"![[{name}]]")
     if attachment_key is None and highlights:

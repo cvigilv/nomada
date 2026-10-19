@@ -110,14 +110,19 @@ A note contains:
 
 - each highlighted passage as a block quote with its page number, linked to
   that page of the annotated PDF in Zotero (`zotero://open-pdf/...?page=N`);
-- an image of each group of handwritten marks, cropped from the page with the
-  printed text around it and embedded as `![[image.png]]`.
+- an image of each group of handwritten marks, embedded as `![[image.png]]`.
+  It shows the whole page in grayscale with only that group in color, so a
+  page with several groups gets several images.
 
 Notes are named the Denote way,
 `20210301T090000==refs--kanerva-2021-title-of-the-paper.md`. The identifier is
 the publication date at 09:00:00; the seconds count up if another note
 already uses it. Images go in the `note_images` folder, or the notes folder if
-that is empty, named after the note's identifier.
+that is empty. Each takes the note's name with its own identifier, the next
+second that no other file uses, and `-annotation-p<page>-<n>` at the end of
+the title:
+`20210301T090001==refs--kanerva-2021-title-of-the-paper-annotation-p4-1.png`.
+`nomada note --force` replaces the images the note embeds.
 
 nomada recognizes a paper's note by the `zotero://select/library/items/KEY`
 link in its front matter, so you can rename notes freely. A paper whose note
