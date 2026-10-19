@@ -322,12 +322,14 @@ def test_note_skips_existing_unless_forced(notes_env):
     child = pdf_child("A2", "a (annotated).pdf", title=env.cfg.annotated_title)
     env.set_items({"P1": [child]}, tag="reviewed", records={"P1": record("P1")})
     env.store("A2", "a (annotated).pdf", annotated_export())
-    # Denote appends keywords to the name once they are added to a note.
-    edited = env.notes / NOTE_NAME.replace(".md", "__hdc.md")
-    edited.write_text("my edits")
+    # A renamed note is still found by the Zotero link in its front matter.
+    edited = env.notes / "20210301T090000--robust-vectors__hdc.md"
+    edited.write_text('---\nzotero: "zotero://select/library/items/P1"\n---\nmy edits\n')
+    # A link to the paper outside the front matter does not make a note its note.
+    (env.notes / "20240101T090000--other.md").write_text("see zotero://select/library/items/P1\n")
 
     assert m.run_note(env.cfg, (), force=False) == 0
-    assert edited.read_text() == "my edits"
+    assert "my edits" in edited.read_text()
     assert not (env.notes / NOTE_NAME).exists()
 
     assert m.run_note(env.cfg, (), force=True) == 0
@@ -351,11 +353,32 @@ def test_note_identifier_skips_taken_seconds(notes_env):
     assert (env.notes / NOTE_NAME.replace("T090000", "T090001")).exists()
 
 
+def test_note_template_keeps_literal_text(notes_env, tmp_path):
+    env, m = notes_env, notes_env.m
+    template = tmp_path / "template.md"
+    template.write_text("---\nzotero: {{zotero_link}}\n---\n# {{title}}\n\n## Summary\n\n## Highlights\n\n{{highlights}}\n")
+    env.cfg.note_template = str(template)
+    child = pdf_child("A2", "a (annotated).pdf", title=env.cfg.annotated_title)
+    env.set_items({"P1": [child]}, records={"P1": record("P1")})
+    env.store("A2", "a (annotated).pdf", annotated_export())
+    assert m.run_note(env.cfg, ("P1",), force=False) == 0
+    text = (env.notes / NOTE_NAME).read_text()
+    assert text.startswith("---\nzotero: zotero://select/library/items/P1\n---\n# Robust Vectors\n\n## Summary\n\n## Highlights\n\n> vectors are robust")
+
+
 def test_note_template_rejects_unknown_placeholder(notes_env, tmp_path):
     template = tmp_path / "template.md"
     template.write_text("# {{title}}\n{{abstract}}\n")
     notes_env.cfg.note_template = str(template)
     with pytest.raises(notes_env.m.click.ClickException, match="unknown placeholder"):
+        notes_env.m.run_note(notes_env.cfg, (), force=False)
+
+
+def test_note_template_requires_zotero_link(notes_env, tmp_path):
+    template = tmp_path / "template.md"
+    template.write_text("---\ntitle: {{title}}\n---\n{{zotero_link}}\n")
+    notes_env.cfg.note_template = str(template)
+    with pytest.raises(notes_env.m.click.ClickException, match="must have {{zotero_link}} in its front matter"):
         notes_env.m.run_note(notes_env.cfg, (), force=False)
 
 

@@ -119,13 +119,18 @@ the publication date at 09:00:00; the seconds count up if another note
 already uses it. Images go in the `note_images` folder, or the notes folder if
 that is empty, named after the note's identifier.
 
-A paper whose note already exists is skipped, including after you add
-keywords to its name (`...__hdc.md`). `nomada note --force` rewrites the note
-in place and replaces its images, which discards your edits to it.
+nomada recognizes a paper's note by the `zotero://select/library/items/KEY`
+link in its front matter, so you can rename notes freely. A paper whose note
+already exists is skipped. `nomada note --force` rewrites the note in place,
+keeping its name, and replaces its images, which discards your edits to it.
 
 The note's layout comes from a template. The built-in one has Denote-style
-front matter, a Highlights section, and a Handwritten notes section. To use
-your own, set `note_template` to a Markdown file that uses these placeholders:
+front matter, an empty Summary section for you to fill in, a Highlights
+section, and a Handwritten notes section. To use your own, set
+`note_template` to a Markdown file, which must have `{{zotero_link}}` in its
+front matter. Text outside placeholders, such as
+headers for sections you write yourself, is copied into the note as is.
+These placeholders are filled in:
 
 | placeholder | value |
 |-------------|-------|

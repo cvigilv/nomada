@@ -380,6 +380,8 @@ zotero:     "{{zotero_link}}"
 
 {{authors}} ({{year}})
 
+## Summary
+
 ## Highlights
 
 {{highlights}}
@@ -418,6 +420,9 @@ def load_template(cfg: Config) -> str:
             f"note template {path} uses unknown placeholder(s) {', '.join(unknown)}; "
             f"known ones are {', '.join(PLACEHOLDERS)}"
         )
+    # A paper's note is found by this link, so every note must carry it.
+    if "zotero_link" not in PLACEHOLDER.findall(front_matter(template)):
+        raise click.ClickException(f"note template {path} must have {{{{zotero_link}}}} in its front matter")
     return template
 
 
@@ -474,11 +479,18 @@ def note_slug(fields: dict[str, str]) -> str:
     return slugify(f"{fields['first_author']} {fields['year']} {fields['title']}")
 
 
-def find_note(notes_dir: Path, slug: str) -> Path | None:
-    """The note for `slug`, with or without the keywords Denote appends after `__`."""
-    found = sorted({*notes_dir.glob(f"*==refs--{slug}.md"), *notes_dir.glob(f"*==refs--{slug}__*.md")})
+def front_matter(text: str) -> str:
+    """The YAML front matter at the start of the Markdown `text`, or "" if it has none."""
+    m = re.match(r"---\n(.*?\n)---(?:\n|$)", text, re.DOTALL)
+    return m.group(1) if m else ""
+
+
+def find_note(notes_dir: Path, key: str) -> Path | None:
+    """The note whose front matter links to Zotero item `key`, whatever its filename."""
+    link = re.compile(rf"zotero://select/library/items/{re.escape(key)}\b")
+    found = [p for p in sorted(notes_dir.glob("*.md")) if link.search(front_matter(p.read_text(errors="replace")))]
     if len(found) > 1:
-        raise NoteError(f"several notes match '{slug}': {', '.join(p.name for p in found)}")
+        raise NoteError(f"several notes link to item {key}: {', '.join(p.name for p in found)}")
     return found[0] if found else None
 
 
@@ -601,15 +613,19 @@ def write_note(
     `attachment_key`; with None, highlights give the page without a link.
     Return the note's path, or None if the item already has a note and
     `force` is false. With `force`, the existing note and its images are
-    replaced, and the note keeps its filename.
+    replaced, and the note keeps its filename. An existing note is
+    recognized by the Zotero link in its front matter.
     """
     fields = paper_fields(item)
-    existing = find_note(cfg.notes_dir, note_slug(fields))
+    existing = find_note(cfg.notes_dir, item["key"])
     if existing and not force:
         return None
     if existing:
         path = existing
-        identifier = existing.name.split("==", 1)[0]
+        m = re.match(r"\d{8}T\d{6}", existing.name)
+        if not m:
+            raise NoteError(f"note {existing.name} has no Denote identifier at the start of its name")
+        identifier = m.group()
     else:
         identifier = new_identifier(cfg.notes_dir, fields["date"])
         path = cfg.notes_dir / f"{identifier}==refs--{note_slug(fields)}.md"
