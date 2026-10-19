@@ -45,6 +45,7 @@ import sys
 import tempfile
 import time
 import tomllib
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -270,12 +271,29 @@ def state_lock() -> Iterator[None]:
         yield
 
 
+def nfc(name: str) -> str:
+    """`name` in Unicode normal form C.
+
+    Sync clients and filesystems may store an accented character either as one
+    code point or as a base letter plus a combining mark, so the same filename
+    can arrive in either form. The state keys filenames by their NFC form, and
+    every lookup must normalize first.
+    """
+    return unicodedata.normalize("NFC", name)
+
+
 def load_state() -> dict:
-    """State holds `map`: INBOX filename -> key of the Zotero item it came from."""
+    """State holds `map`: INBOX filename (NFC) -> key of the Zotero item it came from."""
     if not STATE_FILE.exists():
         return {"map": {}}
     state = json.loads(STATE_FILE.read_text())
-    state.setdefault("map", {})
+    fmap = {}
+    for name, key in state.get("map", {}).items():
+        if fmap.get(nfc(name), key) != key:
+            raise click.ClickException(
+                f"{STATE_FILE} records '{name}' for items {fmap[nfc(name)]} and {key}; remove one of the entries")
+        fmap[nfc(name)] = key
+    state["map"] = fmap
     return state
 
 
@@ -939,12 +957,12 @@ def run_push(cfg: Config) -> int:
             failures += 1
             continue
         # `pull` matches exports to items by filename alone.
-        if fmap.get(fname, key) != key:
-            log(job, f"'{fname}' (item {key}) has the same filename as in-flight item {fmap[fname]}; rename one of them", error=True)
+        if fmap.get(nfc(fname), key) != key:
+            log(job, f"'{fname}' (item {key}) has the same filename as in-flight item {fmap[nfc(fname)]}; rename one of them", error=True)
             failures += 1
             continue
 
-        fmap[fname] = key
+        fmap[nfc(fname)] = key
         dst = cfg.inbox_dir / fname
         if not dst.exists():
             shutil.copy2(src, dst)
@@ -977,7 +995,7 @@ def run_pull(cfg: Config) -> int:
     failures = imported = unmatched = 0
     for pdf in sorted(cfg.export_dir.glob("*.pdf")):
         name = pdf.name
-        key = fmap.get(name)
+        key = fmap.get(nfc(name))
         # Exports that `push` did not send (e.g. notebooks) are not ours to handle.
         if not key:
             unmatched += 1
@@ -1009,11 +1027,11 @@ def run_pull(cfg: Config) -> int:
             log(job, f"can't tag item {key} '{cfg.tag_reviewed}': {e}", error=True)
             failures += 1
 
-        inbox_file = cfg.inbox_dir / name
-        if inbox_file.exists():
-            move_unique(inbox_file, cfg.archive_dir)
+        for inbox_file in cfg.inbox_dir.glob("*.pdf"):
+            if nfc(inbox_file.name) == nfc(name):
+                move_unique(inbox_file, cfg.archive_dir)
         processed = move_unique(pdf, cfg.processed_dir)
-        del fmap[name]
+        del fmap[nfc(name)]
         save_state(state)
 
         if template is not None:
@@ -1265,10 +1283,11 @@ def status() -> None:
     # Listed after the table; neither affects the exit status.
     lists: list[tuple[str, list[str]]] = []
     if cfg.inbox_dir.is_dir():
-        gone = sorted(n for n in fmap if not (cfg.inbox_dir / n).exists())
+        present = {nfc(p.name) for p in cfg.inbox_dir.glob("*.pdf")}
+        gone = sorted(n for n in fmap if n not in present)
         lists.append(("In flight but no longer in INBOX", gone))
     if cfg.export_dir.is_dir():
-        unmatched = sorted(p.name for p in cfg.export_dir.glob("*.pdf") if p.name not in fmap)
+        unmatched = sorted(p.name for p in cfg.export_dir.glob("*.pdf") if nfc(p.name) not in fmap)
         lists.append(("PDFs in EXPORT that match no pushed paper", unmatched))
 
     try:

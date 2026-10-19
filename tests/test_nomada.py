@@ -173,6 +173,26 @@ def test_push_then_pull(env):
     assert m.load_state()["map"] == {}
 
 
+def test_pull_matches_names_in_any_unicode_form(env):
+    m = env.m
+    composed, decomposed = "Verg\u00e9s.pdf", "Verge\u0301s.pdf"
+    env.set_items({"P1": [pdf_child("A1", composed)]})
+    env.store("A1", composed)
+    assert m.run_push(env.cfg) == 0
+
+    write_settled(env.export / decomposed, PDF + b"annotated\n%%EOF\n")
+    assert m.run_pull(env.cfg) == 0
+    (attach,) = attaches(env.writes)
+    assert attach["item_key"] == "P1"
+    assert [p.name for p in (env.inbox / "_archived").iterdir()] == [composed]
+    assert m.load_state()["map"] == {}
+
+
+def test_state_keys_are_normalized_on_load(env):
+    env.m.save_state({"map": {"Verge\u0301s.pdf": "P1"}})
+    assert env.m.load_state()["map"] == {"Verg\u00e9s.pdf": "P1"}
+
+
 def test_push_skips_annotated_copies(env):
     env.set_items({"P1": [pdf_child("A1", "a.pdf"),
                           pdf_child("A2", "a (annotated).pdf", title=env.cfg.annotated_title)]})
