@@ -125,16 +125,18 @@ already exists is skipped. `nomada note --force` rewrites the note in place,
 keeping its name, and replaces its images, which discards your edits to it.
 
 The note's layout comes from a template. The built-in one has Denote-style
-front matter, an empty Summary section for you to fill in, a Highlights
-section, and a Handwritten notes section. To use your own, set
-`note_template` to a Markdown file, which must have `{{zotero_link}}` in its
-front matter. Text outside placeholders, such as
-headers for sections you write yourself, is copied into the note as is.
+front matter, titled `<first author>, <year> - <title>` with `signature:
+refs`, an empty Summary section for you to fill in, a Highlights section, and
+a Handwritten notes section. To use your own, set `note_template` to a
+Markdown file, which must have `{{zotero_link}}` in its front matter. Text
+outside placeholders, such as headers for sections you write yourself, is
+copied into the note as is.
 These placeholders are filled in:
 
 | placeholder | value |
 |-------------|-------|
 | `{{title}}`, `{{authors}}`, `{{first_author}}` | from Zotero; authors are last names, comma-separated |
+| `{{note_title}}` | `<first author>, <year> - <title>` |
 | `{{year}}`, `{{date}}` | publication year and date (`YYYY-MM-DD`, missing parts as `01`) |
 | `{{identifier}}` | the Denote identifier |
 | `{{citekey}}` | Zotero's citation key, or Better BibTeX's from the Extra field |

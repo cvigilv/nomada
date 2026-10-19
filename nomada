@@ -368,15 +368,16 @@ def attach(cfg: Config, parent_key: str, pdf: Path) -> str | None:
 
 NOTE_TEMPLATE = """\
 ---
-title:      "{{title}}"
+title:      "{{note_title}}"
 date:       {{date}}
 tags:       []
 identifier: "{{identifier}}"
+signature:  refs
 citekey:    "{{citekey}}"
 zotero:     "{{zotero_link}}"
 ---
 
-# {{title}}
+# {{note_title}}
 
 {{authors}} ({{year}})
 
@@ -393,7 +394,7 @@ zotero:     "{{zotero_link}}"
 
 PLACEHOLDER = re.compile(r"\{\{\s*(\w+)\s*\}\}")
 PLACEHOLDERS = (
-    "title", "authors", "first_author", "year", "date", "identifier", "citekey",
+    "title", "note_title", "authors", "first_author", "year", "date", "identifier", "citekey",
     "doi", "url", "zotero_key", "zotero_link", "today", "highlights", "handwriting",
 )
 SUPERNOTE_INK = "Supernote_Bitmap"  # /Name of the stamp that holds the Nomad's handwriting
@@ -462,6 +463,7 @@ def paper_fields(item: dict) -> dict[str, str]:
         citekey = found.group(1) if found else ""
     return {
         "title": title,
+        "note_title": f"{names[0]}, {year} - {title}",
         "authors": ", ".join(names),
         "first_author": names[0],
         "year": year,

@@ -312,6 +312,9 @@ def test_pull_writes_note(notes_env):
     text = (env.notes / NOTE_NAME).read_text()
     assert "> vectors are robust ([p. 1](zotero://open-pdf/library/items/NEWKEY?page=1))" in text
     assert 'citekey:    "kanerva2021"' in text
+    assert 'title:      "Kanerva, 2021 - Robust Vectors"\n' in text
+    assert "signature:  refs\n" in text
+    assert "\n# Kanerva, 2021 - Robust Vectors\n" in text
     images = sorted(p.name for p in (env.notes / "attachments").iterdir())
     assert images == ["20210301T090000--p1-1.png", "20210301T090000--p1-2.png"]
     assert all(f"![[{name}]]" in text for name in images)
