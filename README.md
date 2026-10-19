@@ -115,19 +115,23 @@ A note contains:
   page with several groups gets several images.
 
 Notes are named the Denote way,
-`20210301T090000==refs--kanerva-2021-title-of-the-paper.md`. The identifier is
-the publication date at 09:00:00; the seconds count up if another note
-already uses it. Images go in the `note_images` folder, or the notes folder if
-that is empty. Each takes the note's name with its own identifier, the next
-second that no other file uses, and `-annotation-p<page>-<n>` at the end of
-the title:
-`20210301T090001==refs--kanerva-2021-title-of-the-paper-annotation-p4-1.png`.
+`20210301T090000==refs--kanerva-2021-title-of-the-paper__graphlearning_hdc.md`.
+The identifier is the publication date at 09:00:00; the seconds count up if
+another file already uses it. The keywords after `__` are the tags you added
+to the item in Zotero, lowercased, with only letters and digits, and sorted.
+Automatic tags, such as the subjects imports add, and `nomada`'s own three
+tags are left out. The keywords also fill the `tags:` property. Images go in
+the `note_images` folder, or the notes folder if that is empty. Each takes the
+note's name with its own identifier, the next second that no other file uses,
+and `-annotation-p<page>-<n>` at the end of the title:
+`20210301T090001==refs--kanerva-2021-title-of-the-paper-annotation-p4-1__graphlearning_hdc.png`.
 `nomada note --force` replaces the images the note embeds.
 
 nomada recognizes a paper's note by the `zotero://select/library/items/KEY`
 link in its front matter, so you can rename notes freely. A paper whose note
 already exists is skipped. `nomada note --force` rewrites the note in place,
-keeping its name, and replaces its images, which discards your edits to it.
+keeping its name even if the item's tags changed, and replaces its images,
+which discards your edits to it.
 
 The note's layout comes from a template. The built-in one has Denote-style
 front matter, titled `<first author>, <year> - <title>` with `signature:
@@ -144,6 +148,7 @@ These placeholders are filled in:
 | `{{note_title}}` | `<first author>, <year> - <title>` |
 | `{{year}}`, `{{date}}` | publication year and date (`YYYY-MM-DD`, missing parts as `01`) |
 | `{{identifier}}` | the Denote identifier |
+| `{{tags}}` | the Denote keywords as a YAML list, e.g. `["graphlearning", "hdc"]` |
 | `{{citekey}}` | Zotero's citation key, or Better BibTeX's from the Extra field |
 | `{{doi}}`, `{{url}}`, `{{zotero_key}}`, `{{zotero_link}}` | links back to the paper |
 | `{{today}}` | the date the note was written |

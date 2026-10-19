@@ -370,7 +370,7 @@ NOTE_TEMPLATE = """\
 ---
 title:      "{{note_title}}"
 date:       {{date}}
-tags:       []
+tags:       {{tags}}
 identifier: "{{identifier}}"
 signature:  refs
 citekey:    "{{citekey}}"
@@ -394,7 +394,7 @@ zotero:     "{{zotero_link}}"
 
 PLACEHOLDER = re.compile(r"\{\{\s*(\w+)\s*\}\}")
 PLACEHOLDERS = (
-    "title", "note_title", "authors", "first_author", "year", "date", "identifier", "citekey",
+    "title", "note_title", "authors", "first_author", "year", "date", "identifier", "tags", "citekey",
     "doi", "url", "zotero_key", "zotero_link", "today", "highlights", "handwriting",
 )
 SUPERNOTE_INK = "Supernote_Bitmap"  # /Name of the stamp that holds the Nomad's handwriting
@@ -478,6 +478,16 @@ def paper_fields(item: dict) -> dict[str, str]:
         "zotero_link": f"zotero://select/library/items/{key}",
         "today": datetime.now().strftime("%Y-%m-%d"),
     }
+
+
+def denote_keywords(item: dict, exclude: tuple[str, ...]) -> list[str]:
+    """The item's manual Zotero tags, other than `exclude`, as sorted Denote keywords.
+
+    Automatic tags (type 1), such as the subjects that imports add, are left
+    out. A keyword is its tag lowercased, with only its letters and digits.
+    """
+    tags = [t["tag"] for t in item["data"].get("tags", []) if not t.get("type") and t["tag"] not in exclude]
+    return sorted({k for t in tags if (k := "".join(re.findall(r"[^\W_]+", t.lower())))})
 
 
 def note_slug(fields: dict[str, str]) -> str:
@@ -647,6 +657,8 @@ def write_note(
     is recognized by the Zotero link in its front matter.
     """
     fields = paper_fields(item)
+    keywords = denote_keywords(item, cfg.pipeline_tags)
+    fields["tags"] = json.dumps(keywords)  # a YAML flow sequence, as Denote writes it
     existing = find_note(cfg.notes_dir, item["key"])
     if existing and not force:
         return None
@@ -659,7 +671,8 @@ def write_note(
     else:
         start = datetime.strptime(f"{fields['date']} 09:00:00", "%Y-%m-%d %H:%M:%S")
         (identifier,) = free_identifiers(start, 1, taken_identifiers(cfg.notes_dir, cfg.images_dir))
-        path = cfg.notes_dir / f"{identifier}==refs--{note_slug(fields)}.md"
+        suffix = "__" + "_".join(keywords) if keywords else ""
+        path = cfg.notes_dir / f"{identifier}==refs--{note_slug(fields)}{suffix}.md"
 
     highlights, images = read_annotations(job, pdf)
     cfg.images_dir.mkdir(parents=True, exist_ok=True)

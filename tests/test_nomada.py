@@ -384,6 +384,21 @@ def test_note_skips_existing_unless_forced(notes_env):
     ]
 
 
+def test_note_takes_keywords_from_manual_tags(notes_env):
+    env, m = notes_env, notes_env.m
+    item = record("P1")
+    item["data"]["tags"] = [{"tag": "HDC"}, {"tag": "Graph Learning", "type": 0}, {"tag": "reviewed"},
+                            {"tag": "Computer Science - Machine Learning", "type": 1}]
+    child = pdf_child("A2", "a (annotated).pdf", title=env.cfg.annotated_title)
+    env.set_items({"P1": [child]}, records={"P1": item})
+    env.store("A2", "a (annotated).pdf", annotated_export())
+    assert m.run_note(env.cfg, ("P1",), force=False) == 0
+    note = env.notes / NOTE_NAME.replace(".md", "__graphlearning_hdc.md")
+    assert 'tags:       ["graphlearning", "hdc"]\n' in note.read_text()
+    assert sorted(p.name for p in (env.notes / "attachments").iterdir())[0] == (
+        "20210301T090001==refs--kanerva-2021-robust-vectors-annotation-p1-1__graphlearning_hdc.png")
+
+
 def test_note_reports_missing_annotated_pdf(notes_env):
     notes_env.set_items({"P1": [pdf_child("A1", "a.pdf")]}, tag="reviewed", records={"P1": record("P1")})
     assert notes_env.m.run_note(notes_env.cfg, (), force=False) == 1
