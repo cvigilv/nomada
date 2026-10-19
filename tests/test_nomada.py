@@ -358,6 +358,75 @@ def test_handwriting_images_color_one_group_each(nomada, tmp_path):
         assert (rgb[:, :, 0][away[crop]] == expected[crop][away[crop]]).all()
 
 
+def nomad_stamp(page, alpha):
+    """Add handwriting to `page` as the Nomad stores it: a full-page stamp
+    drawing a black image whose alpha mask, `alpha`, holds the ink."""
+    doc, number = page.parent, page.number
+    h, w = alpha.shape
+    rgba = np.zeros((h, w, 4), np.uint8)
+    rgba[:, :, 3] = alpha
+    scratch = doc.new_page()
+    scratch.insert_image(scratch.rect, pixmap=pymupdf.Pixmap(pymupdf.csRGB, w, h, rgba.tobytes(), True))
+    image = scratch.get_images()[0][0]
+    doc.delete_page(scratch.number)
+    page = doc[number]  # deleting a page invalidates the others' objects
+    stamp = page.add_stamp_annot(page.rect)
+    stamp.set_name("Supernote_Bitmap")
+    stamp.update()
+    form = doc.get_new_xref()
+    doc.update_object(form, f"<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] /Resources << /XObject << /I {image} 0 R >> >> >>")
+    doc.update_stream(form, b"/I Do")
+    doc.xref_set_key(stamp.xref, "AP", f"<< /N {form} 0 R >>")
+    # Set by hand: PyMuPDF fits a stamp's rect to the aspect ratio of its text.
+    doc.xref_set_key(stamp.xref, "Rect", f"[0 0 {page.rect.width:g} {page.rect.height:g}]")
+
+
+def test_hidden_ink_groups_but_is_not_drawn(nomada, tmp_path):
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    alpha = np.zeros((792, 612), np.uint8)  # one pixel per point
+    alpha[300:304, 100:200] = 255  # black
+    alpha[310:314, 100:300] = 54   # light gray, beside it
+    alpha[600:604, 100:300] = 54   # light gray, alone
+    nomad_stamp(page, alpha)
+    pdf = tmp_path / "a.pdf"
+    pdf.write_bytes(doc.tobytes())
+    scale = nomada.IMAGE_DPI / 72
+    pad = round(nomada.INK_PAD_PT * scale)
+
+    def blue(png, rows, cols):
+        """Whether each pixel of `png` in the page area `rows` x `cols`, in points, is INK_COLOR."""
+        pix = pymupdf.Pixmap(png)
+        rgb = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n)
+        y0, x0 = round(rows[0] * scale) - pad + 1, round(cols[0] * scale) - pad + 1
+        y1, x1 = round(rows[1] * scale) - pad - 1, round(cols[1] * scale) - pad - 1
+        return (rgb[y0:y1, x0:x1] == nomada.INK_COLOR).all(axis=2)
+
+    (_, box, png), (_, alone, png_alone) = nomada.handwriting_images(pdf, "light gray")
+    assert [round(v) for v in box] == [100, 300, 300, 314]  # widened by the light gray
+    assert blue(png, (300, 304), (100, 200)).all()
+    assert not blue(png, (310, 314), (100, 300)).any()
+    pix = pymupdf.Pixmap(png_alone)
+    assert [round(v) for v in alone] == [100, 600, 300, 604]
+    assert len(set(pix.samples)) == 1, "an empty page, without the ink"
+
+    (_, _, png), _ = nomada.handwriting_images(pdf)
+    assert blue(png, (310, 314), (100, 300)).all()
+
+
+def test_split_ink_keeps_crossing_edges_shown(nomada):
+    alpha = np.zeros((9, 9), np.uint8)
+    alpha[3:6, :] = 27  # light gray edges
+    alpha[4, :] = 54    # light gray
+    alpha[:, 3:6] = 48  # black edges, crossing on top
+    alpha[:, 4] = 255   # black
+    shown, hidden = nomada.split_ink(alpha, 201)
+    black = np.zeros_like(alpha)
+    black[:, 3:6] = alpha[:, 3:6]
+    assert (shown == black).all()
+    assert (hidden == alpha - black).all()
+
+
 def test_annotations_follow_the_text(nomada, tmp_path):
     doc = pymupdf.open()
     page = doc.new_page()
@@ -502,6 +571,14 @@ def test_ink_boxes_groups_nearby_marks(nomada):
     mask[10:20, 10:20] = mask[25:30, 30:40] = True  # one group
     mask[150:160, 150:160] = True                   # another, far away
     assert nomada.ink_boxes(mask, gap=20) == [(10, 10, 39, 29), (150, 150, 159, 159)]
+
+
+def test_config_rejects_unknown_hidden_ink(nomada):
+    nomada.CONFIG_FILE.parent.mkdir(parents=True)
+    nomada.CONFIG_FILE.write_text('inbox = "/x"\nexport = "/y"\nhidden_ink = "blue"\n')
+    result = CliRunner().invoke(nomada.cli, ["note"])
+    assert result.exit_code == 1
+    assert "hidden_ink must be empty or one of dark gray, light gray, got 'blue'" in result.output
 
 
 def test_config_rejects_mistyped_flag(nomada):

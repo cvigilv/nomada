@@ -98,6 +98,7 @@ class Config:
     note_images: str = ""  # folder for note images; empty means `notes`
     note_template: str = ""  # Markdown template file; empty means NOTE_TEMPLATE
     note_on_pull: bool = False
+    hidden_ink: str = ""  # Nomad ink color that groups handwriting but is left out of images; see HIDDEN_INKS
 
     @property
     def inbox_dir(self) -> Path:
@@ -151,6 +152,8 @@ def validate(cfg: Config) -> list[str]:
         problems.append("inbox and export must be set")
     if cfg.note_on_pull and not cfg.notes:
         problems.append("note_on_pull needs notes to be set")
+    if cfg.hidden_ink and cfg.hidden_ink not in HIDDEN_INKS:
+        problems.append(f"hidden_ink must be empty or one of {', '.join(HIDDEN_INKS)}, got {cfg.hidden_ink!r}")
     return problems
 
 
@@ -400,6 +403,10 @@ INK_PAD_PT = 36  # page kept around each group of marks, to crop later by hand
 # Okabe-Ito blue: it stands out from gray for the common kinds of color blindness too.
 INK_COLOR = (0, 114, 178)
 IMAGE_DPI = 150
+# Gray levels of the Nomad's ink colors that `hidden_ink` can name. The stamp
+# stores ink as black with an alpha of 255 minus the gray level. The marker's
+# levels are one lighter than the other pens'.
+HIDDEN_INKS = {"dark gray": 157, "light gray": 201}
 DENOTE_ID = re.compile(r"\d{8}T\d{6}")
 # Embeds of the images `write_note` makes, e.g.
 # ![[20210301T090001==refs--kanerva-2021-robust-vectors-annotation-p1-1.png]]
@@ -580,7 +587,56 @@ def ink_boxes(mask, gap: int) -> list[tuple[int, int, int, int]]:
     return boxes
 
 
-def handwriting_images(path: Path) -> list[tuple[int, tuple[float, float, float, float], bytes]]:
+def neighbors(x, op):
+    """`op` (such as np.maximum) folded over the 8 neighbors of each pixel of the 2-D array `x`."""
+    import functools
+
+    import numpy as np
+
+    h, w = x.shape
+    p = np.pad(x, 1)
+    return functools.reduce(op, (p[dy:dy + h, dx:dx + w] for dy in range(3) for dx in range(3) if (dy, dx) != (1, 1)))
+
+
+def split_ink(alpha, level: int):
+    """Split the alpha mask of a Nomad stamp into (shown, hidden) masks, where
+    hidden holds the strokes of gray `level` and shown the others.
+
+    A stroke's inside has its color's alpha; its anti-aliased edge has
+    fractions of it, which other colors' edges share. So a pixel at the
+    hidden alpha (give or take 2) not next to denser ink starts the hidden
+    strokes, denser ink starts the shown ones, and each edge pixel goes to
+    the strokes that reach it first, the shown ones on a tie. Lighter ink
+    nowhere near the hidden strokes stays shown.
+    """
+    import numpy as np
+
+    a = alpha.astype(np.int16)
+    peak = 255 - level
+    ink = a > 0
+    hidden = (abs(a - peak) <= 2) & (neighbors(a, np.maximum) <= peak + 2)
+    shown = a > peak + 2
+    for _ in range(3):  # edges are at most 2 pixels wide
+        free = ink & ~hidden & ~shown
+        near_shown = neighbors(shown, np.logical_or)
+        hidden |= free & neighbors(hidden, np.logical_or) & ~near_shown
+        shown |= free & near_shown
+    shown |= ink & ~hidden
+    return np.where(shown, alpha, 0).astype(np.uint8), np.where(hidden, alpha, 0).astype(np.uint8)
+
+
+def stamp_alpha_xref(doc, annot) -> int:
+    """The xref of the alpha mask (SMask) of the image a Nomad stamp `annot` draws."""
+    def ref(xref, key):
+        kind, value = doc.xref_get_key(xref, key)
+        if kind != "xref":
+            raise NoteError(f"handwriting stamp {annot.xref} has no {key}; its layout is not the Nomad's")
+        return int(value.split()[0])
+
+    return ref(ref(ref(annot.xref, "AP/N"), "Resources/XObject/I"), "SMask")
+
+
+def handwriting_images(path: Path, hidden_ink: str = "") -> list[tuple[int, tuple[float, float, float, float], bytes]]:
     """Images (page number, box, PNG), one per group of handwritten marks in the export `path`.
 
     The Nomad stores a page's handwriting as one full-page stamp. The marks are
@@ -588,6 +644,10 @@ def handwriting_images(path: Path) -> list[tuple[int, tuple[float, float, float,
     of marks in INK_COLOR and INK_PAD_PT of the page around it, without
     highlights and in grayscale, so other marks nearby show in gray. The box
     (x0, y0, x1, y1), in points, bounds the group.
+
+    Marks in the color `hidden_ink` (a key of HIDDEN_INKS) count when grouping
+    and cropping but are not drawn, so they can outline or join what an image
+    shows.
     """
     import numpy as np
     import pymupdf
@@ -608,14 +668,33 @@ def handwriting_images(path: Path) -> list[tuple[int, tuple[float, float, float,
                 raise NoteError(f"page {page.number + 1} is rotated, which handwriting extraction does not support")
             for xref in [a.xref for a in annots if a.info["name"] != SUPERNOTE_INK]:
                 page.delete_annot(page.load_annot(xref))
+            bare = pixels(page, False)
+            guide = np.zeros(bare.shape[:2], bool)
+            if hidden_ink:
+                layers = {}  # alpha mask xref: (shown, hidden)
+                for annot in page.annots():
+                    xref = stamp_alpha_xref(doc, annot)
+                    pix = pymupdf.Pixmap(doc, xref)
+                    alpha = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w)
+                    layers[xref] = split_ink(alpha, HIDDEN_INKS[hidden_ink])
+
+                def draw(layer):
+                    for xref, masks in layers.items():
+                        doc.update_stream(xref, masks[layer].tobytes())
+                    # MuPDF caches decoded images, which would keep the old masks.
+                    pymupdf.TOOLS.store_shrink(100)
+
+                draw(1)
+                guide = abs(pixels(page, True) - bare).max(axis=2) > 32
+                draw(0)
             color = pixels(page, True)
-            mask = abs(color - pixels(page, False)).max(axis=2) > 32
+            mask = abs(color - bare).max(axis=2) > 32
             gray = (color @ np.array([0.299, 0.587, 0.114])).round()  # ITU-R BT.601 luma
             gray = np.repeat(gray[:, :, None], 3, axis=2)
             # Solid, so ink that is light gray to begin with stands out too.
             tinted = np.array(INK_COLOR)
             # ink_boxes returns disjoint boxes, so each holds only its own group's marks.
-            for x0, y0, x1, y1 in ink_boxes(mask, round(INK_GAP_PT * scale)):
+            for x0, y0, x1, y1 in ink_boxes(mask | guide, round(INK_GAP_PT * scale)):
                 group = np.zeros_like(mask)
                 group[y0:y1 + 1, x0:x1 + 1] = mask[y0:y1 + 1, x0:x1 + 1]
                 out = np.where(group[:, :, None], tinted, gray).astype(np.uint8)
@@ -652,9 +731,10 @@ def flow_position(flow: list[tuple[tuple, list[tuple]]], x: float, y: float) -> 
     return block, max((i for i, box in enumerate(lines) if box[1] <= y), default=0)
 
 
-def read_annotations(job: str, path: Path) -> list[tuple[int, str | bytes]]:
+def read_annotations(job: str, path: Path, hidden_ink: str = "") -> list[tuple[int, str | bytes]]:
     """The highlighted text and handwriting images (PNG) of the export `path`,
-    as (page, content), in the order of the text they are on.
+    as (page, content), in the order of the text they are on. `hidden_ink` is
+    passed to `handwriting_images`.
 
     A highlight is placed at the line where it starts, an image at the line
     beside its center (see `flow_position`). A highlight comes before an
@@ -688,7 +768,7 @@ def read_annotations(job: str, path: Path) -> list[tuple[int, str | bytes]]:
     if ignored:
         kinds = ", ".join(f"{n} {k}" for k, n in sorted(ignored.items()))
         log(job, f"'{path.name}': left out annotations of unsupported types ({kinds})")
-    for page, box, png in handwriting_images(path):
+    for page, box, png in handwriting_images(path, hidden_ink):
         found.append((page, flow_position(flows[page], *center(box)), 1, png))
     # A stable sort, so annotations at the same place keep the order they were found in.
     found.sort(key=lambda a: a[:3])
@@ -729,7 +809,7 @@ def write_note(
         suffix = "__" + "_".join(keywords) if keywords else ""
         path = cfg.notes_dir / f"{identifier}==refs--{note_slug(fields)}{suffix}.md"
 
-    entries = read_annotations(job, pdf)
+    entries = read_annotations(job, pdf, cfg.hidden_ink)
     if attachment_key is None and any(isinstance(content, str) for _, content in entries):
         log(job, f"no Zotero attachment key for '{pdf.name}'; highlights are not linked to Zotero")
 
@@ -1072,9 +1152,11 @@ def config() -> None:
                                       value_proc=_optional_file)
         values["note_on_pull"] = click.confirm("Write a note for each paper `pull` imports?",
                                                default=current.get("note_on_pull", False))
+        values["hidden_ink"] = ask("hidden_ink", "Ink color left out of handwriting images (empty for none)",
+                                   type=click.Choice(["", *HIDDEN_INKS]))
     else:
         values["note_on_pull"] = False
-        for name in ("note_images", "note_template"):
+        for name in ("note_images", "note_template", "hidden_ink"):
             values[name] = current.get(name, "")
 
     cfg = Config(**values)

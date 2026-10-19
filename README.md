@@ -121,6 +121,13 @@ block of text, so a note in the margin sits next to the line it annotates.
 When a highlight and handwriting fall on the same line, the highlight comes
 first.
 
+To draw guides that don't show, set `hidden_ink` to `light gray` or `dark
+gray`, which `nomada config` also asks. Marks in that ink color count when
+grouping and cropping handwriting but are left out of the images. So an
+outline around a figure gives an image of the figure, and a line from one
+note to another puts both in one image. This applies to every pen, because
+the Nomad's export records ink color but not which pen drew it.
+
 Notes are named the Denote way,
 `20210301T090000==refs--kanerva-2021-title-of-the-paper__graphlearning_hdc.md`.
 The identifier is the publication date at 09:00:00; the seconds count up if
