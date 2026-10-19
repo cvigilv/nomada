@@ -329,7 +329,7 @@ def test_handwriting_images_color_one_group_each(nomada, tmp_path):
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(annotated_export())
     images = nomada.handwriting_images(pdf)
-    assert [page for page, _ in images] == [1, 1]
+    assert [page for page, _, _ in images] == [1, 1]
     scale = nomada.IMAGE_DPI / 72
     # Away from the handwriting, each image is the page without highlights, in gray.
     plain = pymupdf.open(pdf)[0].get_pixmap(dpi=nomada.IMAGE_DPI, annots=False, alpha=False)
@@ -338,15 +338,52 @@ def test_handwriting_images_color_one_group_each(nomada, tmp_path):
     away = np.ones(expected.shape, bool)
     for x0, y0, x1, y1 in STAMPS:
         away[math.floor(y0 * scale) - 2:math.ceil(y1 * scale) + 2, math.floor(x0 * scale) - 2:math.ceil(x1 * scale) + 2] = False
-    for (_, png), (x0, y0, x1, y1) in zip(images, STAMPS):
+    pad = round(nomada.INK_PAD_PT * scale)
+    for (_, box, png), (x0, y0, x1, y1) in zip(images, STAMPS):
+        assert x0 - 1 <= box[0] < box[2] <= x1 + 1 and y0 - 1 <= box[1] < box[3] <= y1 + 1
+        # The group's box plus the padding, within the page.
+        bx0, by0, bx1, by1 = (round(v * scale) for v in box)
+        cx0, cy0 = max(bx0 - pad, 0), max(by0 - pad, 0)
+        cx1, cy1 = min(bx1 + pad, expected.shape[1]), min(by1 + pad, expected.shape[0])
         pix = pymupdf.Pixmap(png)
-        assert (pix.w, pix.h) == (math.ceil(595 * scale), math.ceil(842 * scale))  # the whole page
+        assert (pix.w, pix.h) == (cx1 - cx0, cy1 - cy0)
         rgb = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n).astype(int)
         ys, xs = np.nonzero(rgb.max(axis=2) - rgb.min(axis=2) > 0)
-        assert len(ys), "the group keeps its color"
+        assert len(ys), "the group is in color"
+        assert (rgb[ys, xs, 2] > rgb[ys, xs, 0]).all(), "in INK_COLOR, whatever the ink's own color"
+        ys, xs = ys + cy0, xs + cx0
         assert x0 * scale - 2 <= xs.min() and xs.max() <= x1 * scale + 2
         assert y0 * scale - 2 <= ys.min() and ys.max() <= y1 * scale + 2
-        assert (rgb[:, :, 0][away] == expected[away]).all()
+        crop = np.s_[cy0:cy1, cx0:cx1]
+        assert (rgb[:, :, 0][away[crop]] == expected[crop][away[crop]]).all()
+
+
+def test_annotations_follow_the_text(nomada, tmp_path):
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 100), "Vectors are robust to noise.", fontsize=11)
+    page.insert_text((72, 400), "Graphs need encoders.", fontsize=11)
+    page.add_highlight_annot(page.search_for("need encoders", quads=True))
+    # In the margin: beside the first line, then beside the highlighted one.
+    for rect in ((480, 85, 560, 115), (480, 385, 560, 415)):
+        stamp = page.add_stamp_annot(pymupdf.Rect(rect))
+        stamp.set_name("Supernote_Bitmap")
+        stamp.update()
+    pdf = tmp_path / "a.pdf"
+    pdf.write_bytes(doc.tobytes())
+    entries = nomada.read_annotations("test", pdf)
+    assert [type(content) for _, content in entries] == [bytes, str, bytes]
+    assert entries[1] == (1, "need encoders.")
+
+
+def test_flow_position_uses_the_nearest_block(nomada):
+    left = ((46, 60, 303, 120), [(46, 60, 303, 72), (46, 84, 303, 96), (46, 108, 303, 120)])
+    right = ((309, 60, 566, 120), [(309, 60, 566, 72), (309, 84, 566, 96), (309, 108, 566, 120)])
+    flow = [left, right]
+    assert nomada.flow_position(flow, 590, 90) == (1, 1)  # right margin
+    assert nomada.flow_position(flow, 20, 115) == (0, 2)  # left margin
+    assert nomada.flow_position(flow, 100, 30) == (0, 0)  # above the text
+    assert nomada.flow_position([], 100, 30) == (0, 30)
 
 
 def test_annotation_name_keeps_keywords_last(nomada):
@@ -428,14 +465,14 @@ def test_free_identifiers_carry_into_minutes(nomada):
 def test_note_template_keeps_literal_text(notes_env, tmp_path):
     env, m = notes_env, notes_env.m
     template = tmp_path / "template.md"
-    template.write_text("---\nzotero: {{zotero_link}}\n---\n# {{title}}\n\n## Summary\n\n## Highlights\n\n{{highlights}}\n")
+    template.write_text("---\nzotero: {{zotero_link}}\n---\n# {{title}}\n\n## Summary\n\n## Notes\n\n{{annotations}}\n")
     env.cfg.note_template = str(template)
     child = pdf_child("A2", "a (annotated).pdf", title=env.cfg.annotated_title)
     env.set_items({"P1": [child]}, records={"P1": record("P1")})
     env.store("A2", "a (annotated).pdf", annotated_export())
     assert m.run_note(env.cfg, ("P1",), force=False) == 0
     text = (env.notes / NOTE_NAME).read_text()
-    assert text.startswith("---\nzotero: zotero://select/library/items/P1\n---\n# Robust Vectors\n\n## Summary\n\n## Highlights\n\n> vectors are robust")
+    assert text.startswith("---\nzotero: zotero://select/library/items/P1\n---\n# Robust Vectors\n\n## Summary\n\n## Notes\n\n> vectors are robust")
 
 
 def test_note_template_rejects_unknown_placeholder(notes_env, tmp_path):

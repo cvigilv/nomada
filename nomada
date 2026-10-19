@@ -37,6 +37,7 @@ import contextlib
 import dataclasses
 import fcntl
 import json
+import math
 import os
 import re
 import shutil
@@ -383,22 +384,21 @@ zotero:     "{{zotero_link}}"
 
 ## Summary
 
-## Highlights
+## Annotations
 
-{{highlights}}
-
-## Handwritten notes
-
-{{handwriting}}
+{{annotations}}
 """
 
 PLACEHOLDER = re.compile(r"\{\{\s*(\w+)\s*\}\}")
 PLACEHOLDERS = (
     "title", "note_title", "authors", "first_author", "year", "date", "identifier", "tags", "citekey",
-    "doi", "url", "zotero_key", "zotero_link", "today", "highlights", "handwriting",
+    "doi", "url", "zotero_key", "zotero_link", "today", "annotations",
 )
 SUPERNOTE_INK = "Supernote_Bitmap"  # /Name of the stamp that holds the Nomad's handwriting
-INK_GAP_PT = 36  # marks closer than this go into the same image
+INK_GAP_PT = 24  # marks closer than this go into the same image
+INK_PAD_PT = 36  # page kept around each group of marks, to crop later by hand
+# Okabe-Ito blue: it stands out from gray for the common kinds of color blindness too.
+INK_COLOR = (0, 114, 178)
 IMAGE_DPI = 150
 DENOTE_ID = re.compile(r"\d{8}T\d{6}")
 # Embeds of the images `write_note` makes, e.g.
@@ -534,11 +534,10 @@ def annotation_name(note: Path, identifier: str, page: int, n: int) -> str:
     return f"{identifier}{title}-annotation-p{page}-{n}{sep}{keywords}.png"
 
 
-def highlighted_text(page, annot) -> str:
-    """The words whose centers lie inside the quads of the highlight `annot`."""
+def highlighted_text(page, v: list) -> str:
+    """The words whose centers lie inside the quads with vertices `v` of a highlight on `page`."""
     import pymupdf
 
-    v = annot.vertices or []
     quads = [pymupdf.Quad(v[i:i + 4]).rect for i in range(0, len(v) - 3, 4)]
     words = [
         w[4] for w in page.get_text("words")
@@ -581,13 +580,14 @@ def ink_boxes(mask, gap: int) -> list[tuple[int, int, int, int]]:
     return boxes
 
 
-def handwriting_images(path: Path) -> list[tuple[int, bytes]]:
-    """PNG images (page number, bytes), one per group of handwritten marks in the export `path`.
+def handwriting_images(path: Path) -> list[tuple[int, tuple[float, float, float, float], bytes]]:
+    """Images (page number, box, PNG), one per group of handwritten marks in the export `path`.
 
     The Nomad stores a page's handwriting as one full-page stamp. The marks are
-    the pixels that change when the stamp is drawn. Each image shows the whole
-    page without its highlights, in grayscale except for one group of marks,
-    which keeps its color.
+    the pixels that change when the stamp is drawn. Each image shows one group
+    of marks in INK_COLOR and INK_PAD_PT of the page around it, without
+    highlights and in grayscale, so other marks nearby show in gray. The box
+    (x0, y0, x1, y1), in points, bounds the group.
     """
     import numpy as np
     import pymupdf
@@ -596,6 +596,7 @@ def handwriting_images(path: Path) -> list[tuple[int, bytes]]:
         pix = page.get_pixmap(dpi=IMAGE_DPI, annots=annots, alpha=False)
         return np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n).astype(np.int16)
 
+    scale = IMAGE_DPI / 72
     images = []
     # Pages lose their other annotations, in memory only.
     with pymupdf.open(path) as doc:
@@ -609,36 +610,89 @@ def handwriting_images(path: Path) -> list[tuple[int, bytes]]:
                 page.delete_annot(page.load_annot(xref))
             color = pixels(page, True)
             mask = abs(color - pixels(page, False)).max(axis=2) > 32
-            gray = (color @ np.array([0.299, 0.587, 0.114])).round().astype(np.int16)  # ITU-R BT.601 luma
+            gray = (color @ np.array([0.299, 0.587, 0.114])).round()  # ITU-R BT.601 luma
             gray = np.repeat(gray[:, :, None], 3, axis=2)
+            # Solid, so ink that is light gray to begin with stands out too.
+            tinted = np.array(INK_COLOR)
             # ink_boxes returns disjoint boxes, so each holds only its own group's marks.
-            for x0, y0, x1, y1 in ink_boxes(mask, round(INK_GAP_PT * IMAGE_DPI / 72)):
+            for x0, y0, x1, y1 in ink_boxes(mask, round(INK_GAP_PT * scale)):
                 group = np.zeros_like(mask)
                 group[y0:y1 + 1, x0:x1 + 1] = mask[y0:y1 + 1, x0:x1 + 1]
-                out = np.where(group[:, :, None], color, gray).astype(np.uint8)
+                out = np.where(group[:, :, None], tinted, gray).astype(np.uint8)
+                pad = round(INK_PAD_PT * scale)
+                out = np.ascontiguousarray(out[max(y0 - pad, 0):y1 + 1 + pad, max(x0 - pad, 0):x1 + 1 + pad])
                 pix = pymupdf.Pixmap(pymupdf.csRGB, out.shape[1], out.shape[0], out.tobytes(), False)
-                images.append((page.number + 1, pix.tobytes("png")))
+                box = (x0 / scale, y0 / scale, (x1 + 1) / scale, (y1 + 1) / scale)
+                images.append((page.number + 1, box, pix.tobytes("png")))
     return images
 
 
-def read_annotations(job: str, path: Path) -> tuple[list[tuple[int, str]], list[tuple[int, bytes]]]:
-    """Highlights (page, text) and handwriting images (page, PNG) of the export `path`."""
+def text_flow(page) -> list[tuple[tuple, list[tuple]]]:
+    """The text blocks of `page` as (box, line boxes), in the order the PDF
+    stores them, which in typeset papers is reading order."""
+    blocks = page.get_text("dict", sort=False)["blocks"]
+    return [(b["bbox"], [line["bbox"] for line in b["lines"]]) for b in blocks if b["type"] == 0]
+
+
+def flow_position(flow: list[tuple[tuple, list[tuple]]], x: float, y: float) -> tuple[float, float]:
+    """Where the point (x, y) falls in the text `flow` of its page: (block, line).
+
+    The block is the one nearest the point; the line is that block's last
+    line starting at or above `y`, or its first. A note written in the margin
+    gets the line beside it. A page without text orders points by `y`.
+    """
+    if not flow:
+        return 0, y
+
+    def distance(box):
+        return math.hypot(max(box[0] - x, x - box[2], 0), max(box[1] - y, y - box[3], 0))
+
+    block = min(range(len(flow)), key=lambda i: distance(flow[i][0]))
+    lines = flow[block][1]
+    return block, max((i for i, box in enumerate(lines) if box[1] <= y), default=0)
+
+
+def read_annotations(job: str, path: Path) -> list[tuple[int, str | bytes]]:
+    """The highlighted text and handwriting images (PNG) of the export `path`,
+    as (page, content), in the order of the text they are on.
+
+    A highlight is placed at the line where it starts, an image at the line
+    beside its center (see `flow_position`). A highlight comes before an
+    image on the same line.
+    """
     import pymupdf
 
-    highlights = []
+    def center(box):
+        return (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+
+    found = []  # (page, flow position, 0 for a highlight or 1 for an image, content)
+    flows = {}
     ignored: dict[str, int] = {}
     with pymupdf.open(path) as doc:
         for page in doc:
+            highlights = []
             for annot in page.annots():
                 kind = annot.type[1]
                 if kind == "Highlight":
-                    highlights.append((page.number + 1, highlighted_text(page, annot)))
+                    v = annot.vertices or []
+                    highlights.append((v, pymupdf.Quad(v[:4]).rect if len(v) >= 4 else annot.rect))
                 elif not (kind == "Stamp" and annot.info["name"] == SUPERNOTE_INK) and kind != "Popup":
                     ignored[kind] = ignored.get(kind, 0) + 1
+            # Text extraction includes what annotations draw, so the page
+            # loses them first, in memory only.
+            for xref in [a.xref for a in page.annots()]:
+                page.delete_annot(page.load_annot(xref))
+            flow = flows[page.number + 1] = text_flow(page)
+            for v, first in highlights:
+                found.append((page.number + 1, flow_position(flow, *center(first)), 0, highlighted_text(page, v)))
     if ignored:
         kinds = ", ".join(f"{n} {k}" for k, n in sorted(ignored.items()))
         log(job, f"'{path.name}': left out annotations of unsupported types ({kinds})")
-    return highlights, handwriting_images(path)
+    for page, box, png in handwriting_images(path):
+        found.append((page, flow_position(flows[page], *center(box)), 1, png))
+    # A stable sort, so annotations at the same place keep the order they were found in.
+    found.sort(key=lambda a: a[:3])
+    return [(page, content) for page, _, _, content in found]
 
 
 def write_note(
@@ -649,7 +703,8 @@ def write_note(
     Each highlight links to its page in the Zotero attachment
     `attachment_key`; with None, highlights give the page without a link.
     Each handwriting image is named after the note, with its own identifier:
-    the next second after the note's that no other file uses.
+    the next second after the note's that no other file uses. Identifiers
+    and per-page numbers follow the images' order in the note.
 
     Return the note's path, or None if the item already has a note and
     `force` is false. With `force`, the existing note and the images it
@@ -674,21 +729,8 @@ def write_note(
         suffix = "__" + "_".join(keywords) if keywords else ""
         path = cfg.notes_dir / f"{identifier}==refs--{note_slug(fields)}{suffix}.md"
 
-    highlights, images = read_annotations(job, pdf)
-    cfg.images_dir.mkdir(parents=True, exist_ok=True)
-    if existing:
-        for old in ANNOTATION_EMBED.findall(existing.read_text()):
-            (cfg.images_dir / old).unlink(missing_ok=True)
-    taken = taken_identifiers(cfg.notes_dir, cfg.images_dir) | {identifier}
-    start = datetime.strptime(identifier, "%Y%m%dT%H%M%S") + timedelta(seconds=1)
-    embeds = []
-    per_page: dict[int, int] = {}
-    for image_id, (page, png) in zip(free_identifiers(start, len(images), taken), images):
-        per_page[page] = per_page.get(page, 0) + 1
-        name = annotation_name(path, image_id, page, per_page[page])
-        (cfg.images_dir / name).write_bytes(png)
-        embeds.append(f"![[{name}]]")
-    if attachment_key is None and highlights:
+    entries = read_annotations(job, pdf)
+    if attachment_key is None and any(isinstance(content, str) for _, content in entries):
         log(job, f"no Zotero attachment key for '{pdf.name}'; highlights are not linked to Zotero")
 
     def cite(page: int) -> str:
@@ -696,11 +738,25 @@ def write_note(
             return f"p. {page}"
         return f"[p. {page}](zotero://open-pdf/library/items/{attachment_key}?page={page})"
 
-    fields |= {
-        "identifier": identifier,
-        "highlights": "\n\n".join(f"> {text} ({cite(page)})" for page, text in highlights),
-        "handwriting": "\n\n".join(embeds),
-    }
+    cfg.images_dir.mkdir(parents=True, exist_ok=True)
+    if existing:
+        for old in ANNOTATION_EMBED.findall(existing.read_text()):
+            (cfg.images_dir / old).unlink(missing_ok=True)
+    taken = taken_identifiers(cfg.notes_dir, cfg.images_dir) | {identifier}
+    start = datetime.strptime(identifier, "%Y%m%dT%H%M%S") + timedelta(seconds=1)
+    image_ids = iter(free_identifiers(start, sum(isinstance(c, bytes) for _, c in entries), taken))
+    blocks = []
+    per_page: dict[int, int] = {}
+    for page, content in entries:
+        if isinstance(content, str):
+            blocks.append(f"> {content} ({cite(page)})")
+            continue
+        per_page[page] = per_page.get(page, 0) + 1
+        name = annotation_name(path, next(image_ids), page, per_page[page])
+        (cfg.images_dir / name).write_bytes(content)
+        blocks.append(f"![[{name}]]")
+
+    fields |= {"identifier": identifier, "annotations": "\n\n".join(blocks)}
     _atomic_write(path, render_template(template, fields))
     return path
 

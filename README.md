@@ -106,13 +106,20 @@ limits it to the given item keys. If you answer yes to *Write a note for each
 paper `pull` imports?* in `nomada config` (`note_on_pull = true`), `pull` also
 writes a note right after it attaches each paper.
 
-A note contains:
+A note's Annotations section contains, page by page:
 
 - each highlighted passage as a block quote with its page number, linked to
   that page of the annotated PDF in Zotero (`zotero://open-pdf/...?page=N`);
 - an image of each group of handwritten marks, embedded as `![[image.png]]`.
-  It shows the whole page in grayscale with only that group in color, so a
-  page with several groups gets several images.
+  It shows that group in blue with half an inch of the page around it in
+  grayscale, so you can crop it further. A page with several groups gets
+  several images.
+
+Annotations follow the text they are on. A highlight sits at the line where
+it starts, and handwriting at the line beside its center, in the nearest
+block of text, so a note in the margin sits next to the line it annotates.
+When a highlight and handwriting fall on the same line, the highlight comes
+first.
 
 Notes are named the Denote way,
 `20210301T090000==refs--kanerva-2021-title-of-the-paper__graphlearning_hdc.md`.
@@ -135,8 +142,8 @@ which discards your edits to it.
 
 The note's layout comes from a template. The built-in one has Denote-style
 front matter, titled `<first author>, <year> - <title>` with `signature:
-refs`, an empty Summary section for you to fill in, a Highlights section, and
-a Handwritten notes section. To use your own, set `note_template` to a
+refs`, an empty Summary section for you to fill in, and an Annotations
+section. To use your own, set `note_template` to a
 Markdown file, which must have `{{zotero_link}}` in its front matter. Text
 outside placeholders, such as headers for sections you write yourself, is
 copied into the note as is.
@@ -152,7 +159,7 @@ These placeholders are filled in:
 | `{{citekey}}` | Zotero's citation key, or Better BibTeX's from the Extra field |
 | `{{doi}}`, `{{url}}`, `{{zotero_key}}`, `{{zotero_link}}` | links back to the paper |
 | `{{today}}` | the date the note was written |
-| `{{highlights}}`, `{{handwriting}}` | the annotations |
+| `{{annotations}}` | the highlights and handwriting images |
 
 An unknown placeholder is an error. A paper without a title, author, or date
 in Zotero gets no note, and other annotation types are reported and left out.
