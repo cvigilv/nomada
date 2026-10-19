@@ -61,6 +61,8 @@ def record(key, title="Robust Vectors", date="2021-03", author="Kanerva"):
 
 
 STAMPS = ((72, 300, 150, 340), (400, 600, 480, 640))  # points
+INK, DPI = (213, 94, 0), 150  # handwriting image options for tests
+IMAGE_OPTIONS = {"ink_color": "#d55e00", "dpi": DPI}
 
 
 def annotated_export():
@@ -328,14 +330,13 @@ def test_pull_writes_note(notes_env):
 def test_handwriting_images_color_one_group_each(nomada, tmp_path):
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(annotated_export())
-    images = nomada.handwriting_images(pdf)
+    images = nomada.handwriting_images(pdf, **IMAGE_OPTIONS)
     assert [page for page, _, _ in images] == [1, 1]
-    scale = nomada.IMAGE_DPI / 72
-    # Away from the handwriting, each image is the page without highlights, in gray.
-    plain = pymupdf.open(pdf)[0].get_pixmap(dpi=nomada.IMAGE_DPI, annots=False, alpha=False)
-    plain = np.frombuffer(plain.samples, np.uint8).reshape(plain.h, plain.w, 3)
-    expected = (plain @ np.array([0.299, 0.587, 0.114])).round()
-    away = np.ones(expected.shape, bool)
+    scale = DPI / 72
+    # Away from the handwriting, each image is the page without highlights.
+    plain = pymupdf.open(pdf)[0].get_pixmap(dpi=DPI, annots=False, alpha=False)
+    expected = np.frombuffer(plain.samples, np.uint8).reshape(plain.h, plain.w, 3)
+    away = np.ones(expected.shape[:2], bool)
     for x0, y0, x1, y1 in STAMPS:
         away[math.floor(y0 * scale) - 2:math.ceil(y1 * scale) + 2, math.floor(x0 * scale) - 2:math.ceil(x1 * scale) + 2] = False
     pad = round(nomada.INK_PAD_PT * scale)
@@ -348,14 +349,13 @@ def test_handwriting_images_color_one_group_each(nomada, tmp_path):
         pix = pymupdf.Pixmap(png)
         assert (pix.w, pix.h) == (cx1 - cx0, cy1 - cy0)
         rgb = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n).astype(int)
-        ys, xs = np.nonzero(rgb.max(axis=2) - rgb.min(axis=2) > 0)
-        assert len(ys), "the group is in color"
-        assert (rgb[ys, xs, 2] > rgb[ys, xs, 0]).all(), "in INK_COLOR, whatever the ink's own color"
+        ys, xs = np.nonzero((rgb == INK).all(axis=2))
+        assert len(ys), "the group is in INK, whatever the ink's own color"
         ys, xs = ys + cy0, xs + cx0
         assert x0 * scale - 2 <= xs.min() and xs.max() <= x1 * scale + 2
         assert y0 * scale - 2 <= ys.min() and ys.max() <= y1 * scale + 2
         crop = np.s_[cy0:cy1, cx0:cx1]
-        assert (rgb[:, :, 0][away[crop]] == expected[crop][away[crop]]).all()
+        assert (rgb[away[crop]] == expected[crop][away[crop]]).all()
 
 
 def nomad_stamp(page, alpha):
@@ -391,18 +391,18 @@ def test_hidden_ink_groups_but_is_not_drawn(nomada, tmp_path):
     nomad_stamp(page, alpha)
     pdf = tmp_path / "a.pdf"
     pdf.write_bytes(doc.tobytes())
-    scale = nomada.IMAGE_DPI / 72
+    scale = DPI / 72
     pad = round(nomada.INK_PAD_PT * scale)
 
     def blue(png, rows, cols):
-        """Whether each pixel of `png` in the page area `rows` x `cols`, in points, is INK_COLOR."""
+        """Whether each pixel of `png` in the page area `rows` x `cols`, in points, is INK."""
         pix = pymupdf.Pixmap(png)
         rgb = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n)
         y0, x0 = round(rows[0] * scale) - pad + 1, round(cols[0] * scale) - pad + 1
         y1, x1 = round(rows[1] * scale) - pad - 1, round(cols[1] * scale) - pad - 1
-        return (rgb[y0:y1, x0:x1] == nomada.INK_COLOR).all(axis=2)
+        return (rgb[y0:y1, x0:x1] == INK).all(axis=2)
 
-    (_, box, png), (_, alone, png_alone) = nomada.handwriting_images(pdf, "light gray")
+    (_, box, png), (_, alone, png_alone) = nomada.handwriting_images(pdf, hidden_ink="light gray", **IMAGE_OPTIONS)
     assert [round(v) for v in box] == [100, 300, 300, 314]  # widened by the light gray
     assert blue(png, (300, 304), (100, 200)).all()
     assert not blue(png, (310, 314), (100, 300)).any()
@@ -410,7 +410,7 @@ def test_hidden_ink_groups_but_is_not_drawn(nomada, tmp_path):
     assert [round(v) for v in alone] == [100, 600, 300, 604]
     assert len(set(pix.samples)) == 1, "an empty page, without the ink"
 
-    (_, _, png), _ = nomada.handwriting_images(pdf)
+    (_, _, png), _ = nomada.handwriting_images(pdf, **IMAGE_OPTIONS)
     assert blue(png, (310, 314), (100, 300)).all()
 
 
@@ -579,6 +579,18 @@ def test_config_rejects_unknown_hidden_ink(nomada):
     result = CliRunner().invoke(nomada.cli, ["note"])
     assert result.exit_code == 1
     assert "hidden_ink must be empty or one of dark gray, light gray, got 'blue'" in result.output
+
+
+def test_config_rejects_bad_image_options(nomada):
+    nomada.CONFIG_FILE.parent.mkdir(parents=True)
+    nomada.CONFIG_FILE.write_text('inbox = "/x"\nexport = "/y"\nink_color = "red"\nimage_dpi = true\n')
+    result = CliRunner().invoke(nomada.cli, ["note"])
+    assert result.exit_code == 1
+    assert "image_dpi must be an integer" in result.output
+    nomada.CONFIG_FILE.write_text('inbox = "/x"\nexport = "/y"\nink_color = "red"\nimage_dpi = 0\n')
+    result = CliRunner().invoke(nomada.cli, ["note"])
+    assert "ink_color must be a hex color like #d55e00, got 'red'" in result.output
+    assert "image_dpi must be positive, got 0" in result.output
 
 
 def test_config_rejects_mistyped_flag(nomada):

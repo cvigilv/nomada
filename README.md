@@ -111,8 +111,8 @@ A note's Annotations section contains, page by page:
 - each highlighted passage as a block quote with its page number, linked to
   that page of the annotated PDF in Zotero (`zotero://open-pdf/...?page=N`);
 - an image of each group of handwritten marks, embedded as `![[image.png]]`.
-  It shows that group in blue with half an inch of the page around it in
-  grayscale, so you can crop it further. A page with several groups gets
+  It shows that group in one color with half an inch of the page around it
+  in its own colors, so you can crop it further. A page with several groups gets
   several images.
 
 Annotations follow the text they are on. A highlight sits at the line where
@@ -120,6 +120,10 @@ it starts, and handwriting at the line beside its center, in the nearest
 block of text, so a note in the margin sits next to the line it annotates.
 When a highlight and handwriting fall on the same line, the highlight comes
 first.
+
+The group is drawn in `ink_color`, a hex color that is black (`#000000`) by
+default, and images are rendered at `image_dpi`, 300 by default. `nomada
+config` asks for both.
 
 To draw guides that don't show, set `hidden_ink` to `light gray` or `dark
 gray`, which `nomada config` also asks. Marks in that ink color count when

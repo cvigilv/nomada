@@ -99,6 +99,8 @@ class Config:
     note_template: str = ""  # Markdown template file; empty means NOTE_TEMPLATE
     note_on_pull: bool = False
     hidden_ink: str = ""  # Nomad ink color that groups handwriting but is left out of images; see HIDDEN_INKS
+    ink_color: str = "#000000"  # handwriting in note images, as #RRGGBB
+    image_dpi: int = 300  # resolution of note images
 
     @property
     def inbox_dir(self) -> Path:
@@ -136,7 +138,8 @@ class Config:
 FIELDS = {f.name: f for f in dataclasses.fields(Config)}
 # Fields without a default are strings.
 FIELD_TYPES = {name: str if f.default is dataclasses.MISSING else type(f.default) for name, f in FIELDS.items()}
-TYPE_NAMES = {str: "a string", bool: "true or false"}
+TYPE_NAMES = {str: "a string", bool: "true or false", int: "an integer"}
+HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
 
 
 def validate(cfg: Config) -> list[str]:
@@ -154,6 +157,10 @@ def validate(cfg: Config) -> list[str]:
         problems.append("note_on_pull needs notes to be set")
     if cfg.hidden_ink and cfg.hidden_ink not in HIDDEN_INKS:
         problems.append(f"hidden_ink must be empty or one of {', '.join(HIDDEN_INKS)}, got {cfg.hidden_ink!r}")
+    if not HEX_COLOR.fullmatch(cfg.ink_color):
+        problems.append(f"ink_color must be a hex color like #d55e00, got {cfg.ink_color!r}")
+    if cfg.image_dpi < 1:
+        problems.append(f"image_dpi must be positive, got {cfg.image_dpi}")
     return problems
 
 
@@ -172,7 +179,7 @@ def load_config() -> Config:
     problems += [
         f"{k} must be {TYPE_NAMES[FIELD_TYPES[k]]}"
         for k, v in raw.items()
-        if k in FIELDS and not isinstance(v, FIELD_TYPES[k])
+        if k in FIELDS and type(v) is not FIELD_TYPES[k]
     ]
     problems += [
         f"missing required key {name!r}"
@@ -215,6 +222,12 @@ def _existing_dir(value: str) -> str:
 
 def _optional_dir(value: str) -> str:
     return _existing_dir(value) if value else ""
+
+
+def _hex_color(value: str) -> str:
+    if not HEX_COLOR.fullmatch(value):
+        raise click.UsageError(f"{value!r} is not a hex color like #d55e00")
+    return value
 
 
 def _optional_file(value: str) -> str:
@@ -400,9 +413,6 @@ PLACEHOLDERS = (
 SUPERNOTE_INK = "Supernote_Bitmap"  # /Name of the stamp that holds the Nomad's handwriting
 INK_GAP_PT = 24  # marks closer than this go into the same image
 INK_PAD_PT = 36  # page kept around each group of marks, to crop later by hand
-# Okabe-Ito blue: it stands out from gray for the common kinds of color blindness too.
-INK_COLOR = (0, 114, 178)
-IMAGE_DPI = 150
 # Gray levels of the Nomad's ink colors that `hidden_ink` can name. The stamp
 # stores ink as black with an alpha of 255 minus the gray level. The marker's
 # levels are one lighter than the other pens'.
@@ -636,14 +646,17 @@ def stamp_alpha_xref(doc, annot) -> int:
     return ref(ref(ref(annot.xref, "AP/N"), "Resources/XObject/I"), "SMask")
 
 
-def handwriting_images(path: Path, hidden_ink: str = "") -> list[tuple[int, tuple[float, float, float, float], bytes]]:
+def handwriting_images(
+    path: Path, *, hidden_ink: str = "", ink_color: str = Config.ink_color, dpi: int = Config.image_dpi,
+) -> list[tuple[int, tuple[float, float, float, float], bytes]]:
     """Images (page number, box, PNG), one per group of handwritten marks in the export `path`.
 
     The Nomad stores a page's handwriting as one full-page stamp. The marks are
     the pixels that change when the stamp is drawn. Each image shows one group
-    of marks in INK_COLOR and INK_PAD_PT of the page around it, without
-    highlights and in grayscale, so other marks nearby show in gray. The box
-    (x0, y0, x1, y1), in points, bounds the group.
+    of marks in `ink_color` (#RRGGBB) and INK_PAD_PT of the page around it
+    in its own colors, without highlights, so other marks nearby keep their
+    ink's gray. Images are rendered at `dpi`. The box (x0, y0, x1, y1), in
+    points, bounds the group.
 
     Marks in the color `hidden_ink` (a key of HIDDEN_INKS) count when grouping
     and cropping but are not drawn, so they can outline or join what an image
@@ -653,10 +666,10 @@ def handwriting_images(path: Path, hidden_ink: str = "") -> list[tuple[int, tupl
     import pymupdf
 
     def pixels(page, annots):
-        pix = page.get_pixmap(dpi=IMAGE_DPI, annots=annots, alpha=False)
+        pix = page.get_pixmap(dpi=dpi, annots=annots, alpha=False)
         return np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n).astype(np.int16)
 
-    scale = IMAGE_DPI / 72
+    scale = dpi / 72
     images = []
     # Pages lose their other annotations, in memory only.
     with pymupdf.open(path) as doc:
@@ -689,15 +702,13 @@ def handwriting_images(path: Path, hidden_ink: str = "") -> list[tuple[int, tupl
                 draw(0)
             color = pixels(page, True)
             mask = abs(color - bare).max(axis=2) > 32
-            gray = (color @ np.array([0.299, 0.587, 0.114])).round()  # ITU-R BT.601 luma
-            gray = np.repeat(gray[:, :, None], 3, axis=2)
             # Solid, so ink that is light gray to begin with stands out too.
-            tinted = np.array(INK_COLOR)
+            tinted = np.array(list(bytes.fromhex(ink_color[1:])))
             # ink_boxes returns disjoint boxes, so each holds only its own group's marks.
             for x0, y0, x1, y1 in ink_boxes(mask | guide, round(INK_GAP_PT * scale)):
                 group = np.zeros_like(mask)
                 group[y0:y1 + 1, x0:x1 + 1] = mask[y0:y1 + 1, x0:x1 + 1]
-                out = np.where(group[:, :, None], tinted, gray).astype(np.uint8)
+                out = np.where(group[:, :, None], tinted, color).astype(np.uint8)
                 pad = round(INK_PAD_PT * scale)
                 out = np.ascontiguousarray(out[max(y0 - pad, 0):y1 + 1 + pad, max(x0 - pad, 0):x1 + 1 + pad])
                 pix = pymupdf.Pixmap(pymupdf.csRGB, out.shape[1], out.shape[0], out.tobytes(), False)
@@ -731,10 +742,10 @@ def flow_position(flow: list[tuple[tuple, list[tuple]]], x: float, y: float) -> 
     return block, max((i for i, box in enumerate(lines) if box[1] <= y), default=0)
 
 
-def read_annotations(job: str, path: Path, hidden_ink: str = "") -> list[tuple[int, str | bytes]]:
+def read_annotations(job: str, path: Path, **image_options) -> list[tuple[int, str | bytes]]:
     """The highlighted text and handwriting images (PNG) of the export `path`,
-    as (page, content), in the order of the text they are on. `hidden_ink` is
-    passed to `handwriting_images`.
+    as (page, content), in the order of the text they are on. `image_options`
+    are passed to `handwriting_images`.
 
     A highlight is placed at the line where it starts, an image at the line
     beside its center (see `flow_position`). A highlight comes before an
@@ -768,7 +779,7 @@ def read_annotations(job: str, path: Path, hidden_ink: str = "") -> list[tuple[i
     if ignored:
         kinds = ", ".join(f"{n} {k}" for k, n in sorted(ignored.items()))
         log(job, f"'{path.name}': left out annotations of unsupported types ({kinds})")
-    for page, box, png in handwriting_images(path, hidden_ink):
+    for page, box, png in handwriting_images(path, **image_options):
         found.append((page, flow_position(flows[page], *center(box)), 1, png))
     # A stable sort, so annotations at the same place keep the order they were found in.
     found.sort(key=lambda a: a[:3])
@@ -809,7 +820,7 @@ def write_note(
         suffix = "__" + "_".join(keywords) if keywords else ""
         path = cfg.notes_dir / f"{identifier}==refs--{note_slug(fields)}{suffix}.md"
 
-    entries = read_annotations(job, pdf, cfg.hidden_ink)
+    entries = read_annotations(job, pdf, hidden_ink=cfg.hidden_ink, ink_color=cfg.ink_color, dpi=cfg.image_dpi)
     if attachment_key is None and any(isinstance(content, str) for _, content in entries):
         log(job, f"no Zotero attachment key for '{pdf.name}'; highlights are not linked to Zotero")
 
@@ -1113,7 +1124,7 @@ def config() -> None:
     current = {}
     if CONFIG_FILE.exists():
         raw = read_config_file()
-        current = {k: v for k, v in raw.items() if k in FIELDS and isinstance(v, FIELD_TYPES[k])}
+        current = {k: v for k, v in raw.items() if k in FIELDS and type(v) is FIELD_TYPES[k]}
         dropped = sorted(set(raw) - set(current))
         if dropped:
             click.echo(f"warning: dropping unknown or mistyped keys: {', '.join(dropped)}", err=True)
@@ -1154,10 +1165,12 @@ def config() -> None:
                                                default=current.get("note_on_pull", False))
         values["hidden_ink"] = ask("hidden_ink", "Ink color left out of handwriting images (empty for none)",
                                    type=click.Choice(["", *HIDDEN_INKS]))
+        values["ink_color"] = ask("ink_color", "Color of handwriting in note images (#RRGGBB)", value_proc=_hex_color)
+        values["image_dpi"] = ask("image_dpi", "Resolution of note images (DPI)", type=click.IntRange(min=1))
     else:
         values["note_on_pull"] = False
-        for name in ("note_images", "note_template", "hidden_ink"):
-            values[name] = current.get(name, "")
+        for name in ("note_images", "note_template", "hidden_ink", "ink_color", "image_dpi"):
+            values[name] = current.get(name, FIELDS[name].default)
 
     cfg = Config(**values)
     problems = validate(cfg)
