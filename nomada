@@ -437,7 +437,7 @@ INK_PAD_PT = 36  # page kept around each group of marks, to crop later by hand
 HIDDEN_INKS = {"dark gray": 157, "light gray": 201}
 DENOTE_ID = re.compile(r"\d{8}T\d{6}")
 # Embeds of the images `write_note` makes, e.g.
-# ![[20210301T090001==refs--kanerva-2021-robust-vectors-annotation-p1-1.png]]
+# ![[20240506T134513==refs--kanerva-2021-robust-vectors-annotation-p1-1.png]]
 ANNOTATION_EMBED = re.compile(r"!\[\[(\d{8}T\d{6}[^\]|/]*-annotation-p\d+-\d+(?:__[^\]|/]*)?\.png)(?:\|[^\]]*)?\]\]")
 
 
@@ -811,6 +811,8 @@ def write_note(
 
     Each highlight links to its page in the Zotero attachment
     `attachment_key`; with None, highlights give the page without a link.
+    A new note's Denote identifier is the time it is written; an existing
+    note keeps the identifier in its filename.
     Each handwriting image is named after the note, with its own identifier:
     the next second after the note's that no other file uses. Identifiers
     and per-page numbers follow the images' order in the note.
@@ -833,7 +835,7 @@ def write_note(
             raise NoteError(f"note {existing.name} has no Denote identifier at the start of its name")
         identifier = m.group()
     else:
-        start = datetime.strptime(f"{fields['date']} 09:00:00", "%Y-%m-%d %H:%M:%S")
+        start = datetime.now().replace(microsecond=0)
         (identifier,) = free_identifiers(start, 1, taken_identifiers(cfg.notes_dir, cfg.images_dir))
         suffix = "__" + "_".join(keywords) if keywords else ""
         path = cfg.notes_dir / f"{identifier}==refs--{note_slug(fields)}{suffix}.md"

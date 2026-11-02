@@ -132,12 +132,22 @@ def env(nomada, tmp_path, monkeypatch):
                            storage=dirs["storage"], writes=writes, set_items=set_items, store=store)
 
 
+NOW = (2024, 5, 6, 13, 45, 12)  # the frozen note-writing time of the `notes_env` tests
+
+
 @pytest.fixture
-def notes_env(env, tmp_path):
+def notes_env(env, tmp_path, monkeypatch):
     env.notes = tmp_path / "vault"
     env.notes.mkdir()
     env.cfg.notes = str(env.notes)
     env.cfg.note_images = str(env.notes / "attachments")
+
+    class FrozenClock(env.m.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(*NOW, tzinfo=tz)
+
+    monkeypatch.setattr(env.m, "datetime", FrozenClock)
     return env
 
 
@@ -324,7 +334,7 @@ def test_status_lists_stale_and_unmatched(env, monkeypatch):
     assert "PDFs in EXPORT that match no pushed paper (1):\n  notebook.pdf" in result.output
 
 
-NOTE_NAME = "20210301T090000==refs--kanerva-2021-robust-vectors.md"
+NOTE_NAME = "20240506T134512==refs--kanerva-2021-robust-vectors.md"
 
 
 def test_pull_writes_note(notes_env):
@@ -342,8 +352,8 @@ def test_pull_writes_note(notes_env):
     assert "signature:  refs\n" in text
     assert "\n# Kanerva, 2021 - Robust Vectors\n" in text
     images = sorted(p.name for p in (env.notes / "attachments").iterdir())
-    assert images == ["20210301T090001==refs--kanerva-2021-robust-vectors-annotation-p1-1.png",
-                      "20210301T090002==refs--kanerva-2021-robust-vectors-annotation-p1-2.png"]
+    assert images == ["20240506T134513==refs--kanerva-2021-robust-vectors-annotation-p1-1.png",
+                      "20240506T134514==refs--kanerva-2021-robust-vectors-annotation-p1-2.png"]
     assert all(f"![[{name}]]" in text for name in images)
 
 
@@ -522,7 +532,7 @@ def test_note_takes_keywords_from_manual_tags(notes_env):
     note = env.notes / NOTE_NAME.replace(".md", "__graphlearning_hdc.md")
     assert 'tags:       ["graphlearning", "hdc"]\n' in note.read_text()
     assert sorted(p.name for p in (env.notes / "attachments").iterdir())[0] == (
-        "20210301T090001==refs--kanerva-2021-robust-vectors-annotation-p1-1__graphlearning_hdc.png")
+        "20240506T134513==refs--kanerva-2021-robust-vectors-annotation-p1-1__graphlearning_hdc.png")
 
 
 def test_note_reports_missing_annotated_pdf(notes_env):
@@ -533,17 +543,17 @@ def test_note_reports_missing_annotated_pdf(notes_env):
 
 def test_note_identifiers_skip_taken_seconds(notes_env):
     env, m = notes_env, notes_env.m
-    (env.notes / "20210301T090000==refs--other-2021-paper.md").write_text("")
+    (env.notes / "20240506T134512==refs--other-2021-paper.md").write_text("")
     (env.notes / "attachments").mkdir()
-    (env.notes / "attachments" / "20210301T090002==refs--other-2021-paper-annotation-p1-1.png").write_bytes(b"")
+    (env.notes / "attachments" / "20240506T134514==refs--other-2021-paper-annotation-p1-1.png").write_bytes(b"")
     child = pdf_child("A2", "a (annotated).pdf", title=env.cfg.annotated_title)
     env.set_items({"P1": [child]}, records={"P1": record("P1")})
     env.store("A2", "a (annotated).pdf", annotated_export())
     assert m.run_note(env.cfg, ("P1",), force=False) == 0
-    assert (env.notes / NOTE_NAME.replace("T090000", "T090001")).exists()
+    assert (env.notes / NOTE_NAME.replace("T134512", "T134513")).exists()
     names = sorted(p.name for p in (env.notes / "attachments").iterdir())
-    assert names[1:] == ["20210301T090003==refs--kanerva-2021-robust-vectors-annotation-p1-1.png",
-                         "20210301T090004==refs--kanerva-2021-robust-vectors-annotation-p1-2.png"]
+    assert names[1:] == ["20240506T134515==refs--kanerva-2021-robust-vectors-annotation-p1-1.png",
+                         "20240506T134516==refs--kanerva-2021-robust-vectors-annotation-p1-2.png"]
 
 
 def test_free_identifiers_carry_into_minutes(nomada):

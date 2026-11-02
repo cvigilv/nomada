@@ -133,8 +133,8 @@ note to another puts both in one image. This applies to every pen, because
 the Nomad's export records ink color but not which pen drew it.
 
 Notes are named the Denote way,
-`20210301T090000==refs--kanerva-2021-title-of-the-paper__graphlearning_hdc.md`.
-The identifier is the publication date at 09:00:00; the seconds count up if
+`20240506T134512==refs--kanerva-2021-title-of-the-paper__graphlearning_hdc.md`.
+The identifier is the time the note is written; the seconds count up if
 another file already uses it. The keywords after `__` are the tags you added
 to the item in Zotero, lowercased, with only letters and digits, and sorted.
 Automatic tags, such as the subjects imports add, and `nomada`'s own three
@@ -142,7 +142,7 @@ tags are left out. The keywords also fill the `tags:` property. Images go in
 the `note_images` folder, or the notes folder if that is empty. Each takes the
 note's name with its own identifier, the next second that no other file uses,
 and `-annotation-p<page>-<n>` at the end of the title:
-`20210301T090001==refs--kanerva-2021-title-of-the-paper-annotation-p4-1__graphlearning_hdc.png`.
+`20240506T134513==refs--kanerva-2021-title-of-the-paper-annotation-p4-1__graphlearning_hdc.png`.
 `nomada note --force` replaces the images the note embeds.
 
 nomada recognizes a paper's note by the `zotero://select/library/items/KEY`
